@@ -7,7 +7,8 @@
 | qwen3.5-4b | 6.0% | 1.8% | 1.8% | 0.197 | 3.78 | 23.9k | 8.0 |
 | Olmo_0716_step500 | 17.4% | 12.8% | 9.2% | 0.410 | 6.75 | 78.6k | 34.4 |
 | sushi_0803_step575 | 14.7% | 9.2% | 5.5% | 0.414 | 7.08 | 64.7k | 27.2 |
-| sushi_0806_v1_step550 (temp) | 13.8% | 11.0% | 5.5% | 0.435 | — | — | — |
+| run_0806_v1_step550 | 13.8% | 11.0% | 5.5% | 0.435 | 6.41 | 67.3k | 28.1 |
+| run_0806_v2_step400 | 20.2% | 12.8% | 8.3% | 0.490 | 6.53 | 77.5k | 23.2 |
 
 - **pass@1 ↑:** The percentage of individual runs with a judge score of at least 0.85.
 - **SSR ↑:** The percentage of tasks whose average score across the two runs is at least 0.85.

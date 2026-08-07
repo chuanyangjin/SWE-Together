@@ -41,14 +41,14 @@ HARBOR_SRC = HARBOR_ROOT / "src"
 sys.path.insert(0, str(HARBOR_SRC))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from harbor.models.environment_type import EnvironmentType
-from harbor.models.trial.config import (
+from harbor.models.environment_type import EnvironmentType  # noqa: E402
+from harbor.models.trial.config import (  # noqa: E402
     AgentConfig,
     EnvironmentConfig,
     TaskConfig,
     TrialConfig,
 )
-from harbor.trial.trial import Trial
+from harbor.trial.trial import Trial  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("runner")
@@ -86,6 +86,10 @@ _PROVIDER_MAP = {
     "minimaxd":    ("MINIMAX_API_KEY",     "ANTHROPIC_API_KEY"),
     "ark":         ("ARK_API_KEY",         "ANTHROPIC_API_KEY"),
     "deepseek":    ("DEEPSEEK_API_KEY",    "ANTHROPIC_API_KEY"),
+    # Opus 4.8 (and other metagen models) via the x2p gateway. Key = the
+    # gateway key in ANTHROPIC_API_KEY (mg-api-…). Routed through the in-sandbox
+    # litellm proxy so opencode/node can reach the gateway via the relay.
+    "metagen":     ("ANTHROPIC_API_KEY",   "ANTHROPIC_API_KEY"),
 }
 
 # Proxy URLs for routing non-Anthropic models through Claude Code CLI.
@@ -101,6 +105,8 @@ _MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
 _ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/coding"
 _GLMD_BASE_URL = "https://api.z.ai/api/anthropic"
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
+# metagen x2p gateway (Anthropic Messages API; auth via x-api-key: mg-api-…).
+_METAGEN_BASE_URL = "http://anthropic.ai-gateway.x2p.facebook.net"
 
 
 def resolve_model(model_arg: str) -> tuple[str, str, str]:
@@ -225,7 +231,7 @@ def _compute_message_guidance(gt_count: int) -> tuple[int, int]:
 
 def _extract_gt_session_duration(task_dir: Path) -> float | None:
     """Extract the original session duration in seconds from original_session.json."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     session_path = task_dir / "original_session.json"
     if not session_path.exists():
@@ -558,7 +564,15 @@ async def run_single_task(task_name: str, tar_path: Path | None, args) -> None:
 
     env_type = getattr(args, 'env_type', None)
     env_kwargs: dict = {"delete": not args.keep}
-    if env_type:
+    environment_build_timeout_multiplier = None
+    if env_type == "podman":
+        env_kwargs["import_path"] = "podman_env:PodmanEnvironment"
+    elif env_type == "sandoq":
+        env_kwargs["import_path"] = "sandoq_env:SandoqEnvironment"
+        environment_build_timeout_multiplier = float(
+            os.environ.get("SANDOQ_BUILD_TIMEOUT_MULTIPLIER", "3")
+        )
+    elif env_type:
         env_kwargs["type"] = EnvironmentType(env_type)
 
     trial_config = TrialConfig(
@@ -566,6 +580,7 @@ async def run_single_task(task_name: str, tar_path: Path | None, args) -> None:
         trials_dir=Path(args.trials_dir),
         agent=agent_config,
         environment=EnvironmentConfig(**env_kwargs),
+        environment_build_timeout_multiplier=environment_build_timeout_multiplier,
     )
 
     trial = Trial(config=trial_config)
@@ -754,8 +769,9 @@ def main():
                              "'codex' uses Codex CLI with user sim via sequential re-runs. "
                              "Others use Harbor's installed CLI agents (no user sim).")
     parser.add_argument("--env-type",   default=None,
-                        choices=["docker", "e2b", "daytona", "modal", "gke"],
-                        help="Environment type (default: docker). Use 'e2b' for cloud sandbox.")
+                        choices=["docker", "e2b", "daytona", "modal", "gke", "podman", "sandoq"],
+                        help="Environment type (default: docker). Use 'sandoq' for the "
+                             "authenticated OCI-runner backend.")
     parser.add_argument("--setup-timeout", default=None, type=float,
                         help="Agent setup timeout in seconds (default: 360). Increase for slow E2B installs.")
     parser.add_argument("--agent-timeout", default=None, type=float,
@@ -787,6 +803,16 @@ def main():
         keep                  = cli.keep       or cfg.get("keep_container", False)
         user_context_chars    = cfg.get("user_context_chars",    3000)
         call_user_on_completion = cfg.get("call_user_on_completion", True)
+
+    if Args.env_type == "sandoq":
+        # Fail once before constructing a Trial.  Otherwise a missing bearer
+        # token is recorded as a misleading per-trial sandbox failure.
+        from sandoq_env import _read_token
+
+        try:
+            _read_token()
+        except RuntimeError as exc:
+            parser.error(str(exc))
 
     asyncio.run(run(Args()))
 

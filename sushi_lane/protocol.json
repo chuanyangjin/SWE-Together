@@ -1,0 +1,50 @@
+{
+  "lane": "sushi_0803_step575",
+  "checkpoint": "/checkpoint/ram/chuanyang/autodata/run_0803/weights/step_575",
+  "served_model": "sushi_0803_step575",
+  "action_model": "openai/sushi_0803_step575",
+  "action_agent": "opencode@1.15.13",
+  "environment_import_path": "podman_env:PodmanEnvironment",
+  "benchmark_tasks": 109,
+  "replicates": 2,
+  "agent_timeout_sec": 4800,
+  "context_limit": 131072,
+  "output_limit": 32768,
+  "service_security": {
+    "vllm_auth": "per-run strong bearer loaded from an owner-only file",
+    "sampling_proxy_bind": "127.0.0.1",
+    "sampling_proxy_client_auth": "non-secret local placeholder translated to the upstream bearer",
+    "identity_preflight": "authenticated health + exact served model + exact checkpoint root"
+  },
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "sampling": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "presence_penalty": 1.5,
+    "repetition_penalty": 1.05,
+    "max_tokens": 32768
+  },
+  "user_simulator": {
+    "model": "anthropic/claude-opus-4-8",
+    "requested_temperature": 0.5,
+    "effective_temperature": null,
+    "context_chars": 3000,
+    "call_on_completion": true,
+    "effective_api_base_host": "anthropic.ai-gateway.x2p.facebook.net",
+    "routing_note": "src/run_eval.py prefers ANTHROPIC_BASE_URL from .env for the user simulator and falls back to https://api.anthropic.com only when that value is absent. The internal Opus 4.8 gateway rejects temperature, so Harbor records the requested 0.5 and retries effectively without a temperature field."
+  },
+  "correctness_judge": "anthropic/claude-opus-4-6",
+  "message_tagger": {
+    "model": "gemini/gemini-3.1-pro-preview",
+    "backend": "vertex-gateway"
+  },
+  "notes": [
+    "vLLM 0.20.1 serves local safetensors with load_format=auto.",
+    "Thinking-on smoke probes exhibited recursive reasoning and failed to emit a structured tool call; no-thinking emitted an exact structured tool call.",
+    "sushi_lane/sampling_proxy.py pins the recorded request profile for every chat-completions request.",
+    "Gemini 3.1 Pro is used only for message tagging, not for user simulation."
+  ]
+}

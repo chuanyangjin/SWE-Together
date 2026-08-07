@@ -16,21 +16,20 @@ rather than killing the trial.
 
 Default caps (shared by every harness):
   - PER_EXEC_CAP_SEC (1800) — per-turn single-call ceiling (30m).
-  - TRIAL_BUDGET_SEC (5400) — total per-trial budget (90m), set equal to
-    the E2B sandbox lifetime so the wrapper's own budget is the real
-    ceiling and stops cleanly, instead of the sandbox dying mid-trial.
+  - TRIAL_BUDGET_SEC (5400 fallback) — total per-trial budget. Production
+    launchers derive this as the outer agent timeout minus 60 seconds so patch
+    capture and the verifier transition finish before Harbor's hard deadline.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
-
-import os
 
 TRIAL_BUDGET_SEC = int(os.environ.get("TRIAL_BUDGET_SEC", "5400"))
 PER_EXEC_CAP_SEC = int(os.environ.get("PER_EXEC_CAP_SEC", "1800"))
@@ -48,7 +47,13 @@ class _TimeoutResult:
     stderr: str = ""
 
 
-async def exec_with_budget(environment, exec_input, *, start_time: float):
+async def exec_with_budget(
+    environment,
+    exec_input,
+    *,
+    start_time: float,
+    trial_budget_sec: int | None = None,
+):
     """Run one ExecInput with the trial-budget + per-exec cap.
 
     Wraps the underlying `environment.exec()` in `asyncio.wait_for` so a
@@ -63,8 +68,11 @@ async def exec_with_budget(environment, exec_input, *, start_time: float):
     `set -o pipefail; ...` is prepended to the command (matching what
     every existing call-site already does).
     """
+    budget = TRIAL_BUDGET_SEC if trial_budget_sec is None else trial_budget_sec
+    if budget <= 0:
+        raise ValueError("trial_budget_sec must be positive")
     elapsed = time.monotonic() - start_time
-    remaining = max(TRIAL_BUDGET_SEC - elapsed, 1.0)
+    remaining = max(budget - elapsed, 1.0)
     cap_sec = int(min(remaining, PER_EXEC_CAP_SEC))
 
     try:

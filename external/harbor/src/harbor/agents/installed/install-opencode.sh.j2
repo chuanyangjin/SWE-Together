@@ -1,19 +1,47 @@
 #!/bin/bash
 set -euo pipefail
 
-apt-get update
-apt-get install -y curl ca-certificates
-
-# Install Node.js 22 via NodeSource (deb.nodesource.com).
+# Node.js. Upstream installs it via NodeSource apt (deb.nodesource.com). That is
+# unusable in the on-cluster podman harness for TWO reasons: the Ubuntu archive
+# is not in the egress allowlist, AND apt cannot even run under the single-uid
+# `unshare -Urm` userns (it drops privileges to the `_apt` user, uid 42, which
+# isn't mapped → "seteuid 42 failed / setgroups Operation not permitted").
 #
-# We deliberately do NOT use nvm here: nvm's installer is fetched from
-# raw.githubusercontent.com and then clones github.com, both of which are
-# sinkholed to 127.0.0.1 by the PR #221 contamination defense (seal-dns.sh).
-# That made agent setup fail with `curl: (7) ... raw.githubusercontent.com`
-# on ~58% of trials. NodeSource's apt repo is not sinkholed, so node installs
-# cleanly while the github/raw sinkhole stays fully intact for the agent.
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-apt-get install -y nodejs
+# So: if the image already provides node+npm (NodeSource-based images), use them.
+# Otherwise install the official static node build from nodejs.org (reachable via
+# the proxy) — this covers bun-only task images that have no node at all. We
+# deliberately avoid nvm (its installer is fetched from raw.githubusercontent.com
+# / github.com, both DNS-sinkholed by the PR #221 contamination defense).
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+  :
+else
+  NODE_VER="${NODE_VERSION:-v22.11.0}"
+  case "$(uname -m)" in
+    x86_64) NARCH=x64 ;;
+    aarch64) NARCH=arm64 ;;
+    *) NARCH=x64 ;;
+  esac
+  # Use gzip, not xz: several minimal task images have tar+gzip but no `xz`
+  # binary.  GNU tar then reports `xz: Cannot exec`, the tolerated extraction
+  # failure leaves /opt/node empty, and setup later dies with node=127.
+  curl -fsSL "https://nodejs.org/dist/${NODE_VER}/node-${NODE_VER}-linux-${NARCH}.tar.gz" \
+    -o /tmp/node.tar.gz
+  mkdir -p /opt/node
+  # Extract with the current uid + umask, not the archived metadata. As root
+  # under the single-uid userns tar can restore neither ownership
+  # (--no-same-owner: archived uid/gid 1000 → EINVAL) nor, on some 24.04 images,
+  # the mode of the bin/ symlinks (--no-same-permissions still hits lchmod EPERM,
+  # "Cannot change mode"). Those symlinks are the LAST entries and are already
+  # created before the failing chmod, so tolerate a nonzero tar exit and let the
+  # `node -v`/`npm -v` checks below (under `set -e`) be the real gate.
+  tar --no-same-owner --no-same-permissions -xzf /tmp/node.tar.gz \
+    -C /opt/node --strip-components=1 || true
+  # Symlink into /usr/local/bin so BOTH this (login-ish) setup shell AND the
+  # non-login `bash -c` used to run the agent later resolve node/npm/npx.
+  ln -sf /opt/node/bin/node /usr/local/bin/node
+  ln -sf /opt/node/bin/npm  /usr/local/bin/npm
+  ln -sf /opt/node/bin/npx  /usr/local/bin/npx
+fi
 node -v
 npm -v
 
@@ -22,5 +50,12 @@ npm i -g opencode-ai@{{ version }}
 {% else %}
 npm i -g opencode-ai@latest
 {% endif %}
+
+# When node came from the nodejs.org tarball, `npm i -g` puts the opencode binary
+# under /opt/node/bin (off the default PATH). Symlink it onto /usr/local/bin so
+# the agent-run command (`... opencode run ...`, a non-login shell) finds it.
+if [ -x /opt/node/bin/opencode ]; then
+  ln -sf /opt/node/bin/opencode /usr/local/bin/opencode
+fi
 
 opencode --version

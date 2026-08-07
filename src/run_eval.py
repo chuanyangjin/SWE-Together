@@ -33,36 +33,36 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Ensure src/ and harbor/ are importable
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "external" / "harbor" / "src"))
 
-from harbor.environments.base import EnvironmentType
-from harbor.models.job.config import EnvironmentConfig
-from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
-from harbor.orchestrators.local import LocalOrchestrator, RetryConfig
+from harbor.environments.base import EnvironmentType  # noqa: E402
+from harbor.models.job.config import EnvironmentConfig  # noqa: E402
+from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig  # noqa: E402
+from harbor.orchestrators.local import LocalOrchestrator, RetryConfig  # noqa: E402
 
-from eval_infra_sentinel import (
+from eval_infra_sentinel import (  # noqa: E402
     classify_or_load,
     classify_trial,
     write_sidecar,
 )
 
 # Import shared utilities from runner.py
-from runner import (
+from runner import (  # noqa: E402
     resolve_model,
     load_analysis,
     load_user_messages,
     _compute_message_guidance,
     resolve_task_dir,
-    REPO_ROOT as RUNNER_REPO_ROOT,
-    _CHUTES_BASE_URL,
     _OPENROUTER_BASE_URL,
     _FIREWORKS_BASE_URL,
     _GLM_BASE_URL,
@@ -70,6 +70,7 @@ from runner import (
     _ARK_BASE_URL,
     _GLMD_BASE_URL,
     _DEEPSEEK_BASE_URL,
+    _METAGEN_BASE_URL,
 )
 
 logging.basicConfig(
@@ -93,6 +94,7 @@ AGENT_IMPORT_PATH = "user_agent.agents.user_enabled_claude_code:UserEnabledClaud
 CODEX_AGENT_IMPORT_PATH = "user_agent.agents.user_enabled_codex:UserEnabledCodex"
 MINI_SWE_AGENT_IMPORT_PATH = "user_agent.agents.user_enabled_mini_swe_agent:UserEnabledMiniSweAgent"
 OPENCODE_IMPORT_PATH = "user_agent.agents.user_enabled_opencode:UserEnabledOpenCode"
+_QWEN_LOOPBACK_PLACEHOLDER = "qwen-loopback-placeholder"
 
 # Env vars the codex wrapper inspects on the host — forwarded into the trial's
 # agent_env so the in-sandbox wrapper sees them (CODEX_USE_HOST_AUTH triggers
@@ -106,6 +108,41 @@ _CODEX_FORWARDED_HOST_ENV = (
     "CODEX_USE_HOST_AUTH", "CODEX_HOST_AUTH_JSON",
     "CODEX_USE_RESUME", "OPENAI_BASE_URL",
 )
+
+
+def validate_qwen_loopback_proxy(model_arg: str) -> None:
+    """Require the secure loopback bridge for every Qwen3.5-4B run."""
+
+    secure_mode = os.environ.get("SWE_QWEN_LOOPBACK_PROXY") == "1"
+    qwen_model = model_arg == "openai/Qwen3.5-4B"
+    if qwen_model and not secure_mode:
+        raise ValueError(
+            "openai/Qwen3.5-4B requires SWE_QWEN_LOOPBACK_PROXY=1"
+        )
+    if not secure_mode:
+        return
+    if not qwen_model:
+        raise ValueError(
+            "SWE_QWEN_LOOPBACK_PROXY=1 is restricted to openai/Qwen3.5-4B"
+        )
+    parsed = urlsplit(os.environ.get("OPENAI_BASE_URL", ""))
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path.rstrip("/") != "/v1"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "secure Qwen mode requires OPENAI_BASE_URL=http://127.0.0.1:<port>/v1"
+        )
+    if os.environ.get("OPENAI_API_KEY") != _QWEN_LOOPBACK_PLACEHOLDER:
+        raise ValueError(
+            "secure Qwen mode requires the nonsecret loopback placeholder key"
+        )
 
 
 def get_all_tasks() -> list[str]:
@@ -128,8 +165,8 @@ def get_all_tasks() -> list[str]:
     return runnable
 
 
-def is_task_completed(task_name: str, trials_dir: Path) -> bool:
-    """Check if a task has a successful trial.
+def count_completed_trials(task_name: str, trials_dir: Path) -> int:
+    """Count completed, non-infrastructure-failed trials for a task.
 
     A trial counts as completed only if (a) Harbor recorded a verifier
     result AND (b) the infra sentinel says the agent actually ran. Trials
@@ -138,11 +175,12 @@ def is_task_completed(task_name: str, trials_dir: Path) -> bool:
     silently inheriting the bad data point.
     """
     if not trials_dir.exists():
-        return False
+        return 0
     # Harbor truncates trial dir names to 32 chars of task name; match on
     # the truncated prefix or long-named tasks (4 in lite70) are NEVER
     # seen as complete and get re-run on every --skip-existing relaunch.
     dir_prefix = task_name[:32] + "__"
+    completed = 0
     for d in trials_dir.iterdir():
         if not (d.is_dir() and d.name.startswith(dir_prefix)):
             continue
@@ -153,8 +191,21 @@ def is_task_completed(task_name: str, trials_dir: Path) -> bool:
             result = json.loads(result_path.read_text())
         except (json.JSONDecodeError, OSError):
             continue
+        if not isinstance(result, dict):
+            continue
         vr = result.get("verifier_result")
-        if not (vr and vr.get("rewards")):
+        rewards = vr.get("rewards") if isinstance(vr, dict) else None
+        reward = rewards.get("reward") if isinstance(rewards, dict) else None
+        try:
+            valid_reward = (
+                bool(rewards)
+                and isinstance(reward, (int, float))
+                and not isinstance(reward, bool)
+                and math.isfinite(float(reward))
+            )
+        except (TypeError, ValueError):
+            valid_reward = False
+        if not valid_reward:
             continue
         verdict = classify_or_load(d)
         if verdict.status == "infra_failed":
@@ -163,8 +214,13 @@ def is_task_completed(task_name: str, trials_dir: Path) -> bool:
                 task_name, d.name, verdict.reason,
             )
             continue
-        return True
-    return False
+        completed += 1
+    return completed
+
+
+def is_task_completed(task_name: str, trials_dir: Path) -> bool:
+    """Backward-compatible single-replicate completion check."""
+    return count_completed_trials(task_name, trials_dir) >= 1
 
 
 def build_agent_env(model_arg: str, action_model: str, action_key: str) -> dict[str, str]:
@@ -195,6 +251,19 @@ def build_agent_env(model_arg: str, action_model: str, action_key: str) -> dict[
         effort = os.environ.get("CLAUDE_CODE_EFFORT_LEVEL")
         if effort:
             env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+        return env
+
+    if provider == "openai":
+        # OpenAI-compatible endpoint (e.g. the local vLLM/LiteLLM proxy serving
+        # Qwen3.5-4B). opencode's openai provider + Harbor's OpenCode adapter
+        # read OPENAI_API_KEY; the custom OPENAI_BASE_URL is baked into the
+        # container by PodmanEnvironment (Harbor's opencode adapter forwards the
+        # key but NOT the base URL). We deliberately do NOT set ANTHROPIC_API_KEY
+        # here — the generic fallback below does, which would clobber the
+        # user-sim's gateway key in os.environ.
+        env["OPENAI_API_KEY"] = action_key
+        if os.environ.get("OPENAI_BASE_URL"):
+            env["OPENAI_BASE_URL"] = os.environ["OPENAI_BASE_URL"]
         return env
 
     if provider == "openrouter":
@@ -358,6 +427,18 @@ def build_agent_env(model_arg: str, action_model: str, action_key: str) -> dict[
         env["DEEPSEEK_API_KEY"] = action_key
         return env
 
+    if provider == "metagen":
+        # Opus 4.8 via the metagen x2p gateway. Route through the in-sandbox
+        # litellm proxy (localhost:4210) exactly like ark/glmd/deepseek: opencode
+        # runs on node/undici, which ignores http_proxy, and the gateway is only
+        # reachable through the relay — so pointing opencode straight at the
+        # gateway hangs (STATUS.md). The python proxy DOES honor http_proxy →
+        # relay → gateway; _proxy_env keeps ANTHROPIC_BASE_URL=localhost:4210 so
+        # the gateway host is never added to the container no_proxy.
+        opus_model = model_arg.split("/", 1)[1]
+        env.update(_proxy_env(_METAGEN_BASE_URL, opus_model, action_key))
+        return env
+
     # Unknown provider — pass key directly
     env["ANTHROPIC_API_KEY"] = action_key
     return env
@@ -378,6 +459,7 @@ def build_trial_config(
     force_build: bool = False,
     agent_type: str = "claude-code",
     reasoning_effort: str | None = None,
+    user_temperature: float = 0.5,
 ) -> TrialConfig:
     """Build a TrialConfig with per-task user sim kwargs."""
     # Load per-task data
@@ -418,6 +500,7 @@ def build_trial_config(
         "user_model_name": user_model,
         "user_api_key": user_key,
         "user_api_base": user_api_base,
+        "user_temperature": user_temperature,
         "original_user_messages": user_messages,
         "session_analysis": session_analysis_with_guidance,
         "max_messages": None,
@@ -543,10 +626,31 @@ def build_trial_config(
     # points at a leaky GitHub PR/issue page.
     import tomllib
     task_toml_path = task_dir / "task.toml"
+    task_agent_timeout: float | None = None
     if task_toml_path.exists():
         with open(task_toml_path, "rb") as _f:
-            _per_task = (tomllib.load(_f).get("agent") or {}).get("kwargs") or {}
+            task_data = tomllib.load(_f)
+        task_agent = task_data.get("agent") or {}
+        _per_task = task_agent.get("kwargs") or {}
+        task_agent_timeout = task_agent.get("timeout_sec")
         user_sim_kwargs.update(_per_task)
+
+    # The multi-turn wrapper must stop before Harbor's outer agent deadline so
+    # it can capture final.patch and transition to the verifier.  Derive this
+    # per trial when the CLI leaves --agent-timeout unset; a process-global
+    # 5400s fallback is unsafe because task.toml timeouts vary (1800/3600s).
+    outer_timeout = agent_timeout if agent_timeout is not None else task_agent_timeout
+    if outer_timeout is not None:
+        timeout = int(outer_timeout)
+        if timeout <= 0:
+            raise ValueError(f"agent timeout must be positive: {outer_timeout!r}")
+        explicit_budget = os.environ.get("TRIAL_BUDGET_SEC")
+        budget = int(explicit_budget) if explicit_budget else (
+            timeout - 60 if timeout > 60 else timeout
+        )
+        if budget <= 0:
+            raise ValueError(f"trial budget must be positive: {budget}")
+        user_sim_kwargs["trial_budget_sec"] = budget
 
     agent_config = AgentConfig(
         import_path=import_path,
@@ -557,7 +661,22 @@ def build_trial_config(
     )
 
     env_config = EnvironmentConfig(delete=True, force_build=force_build)
-    if env_type:
+    environment_build_timeout_multiplier = None
+    if env_type == "podman":
+        # Local rootless-podman sandbox — selected via import_path so Harbor
+        # needs no factory registration (see src/podman_env.py). Leave .type None
+        # so EnvironmentConfig's validator doesn't default it to docker.
+        env_config.import_path = "podman_env:PodmanEnvironment"
+    elif env_type == "sandoq":
+        # Remote Sandoq OCI runner — lease the fixed authenticated outer runner,
+        # then pull/start each task image under nested Podman + gVisor. Pulls can
+        # legitimately exceed a task's usual 600s image-build timeout, so give
+        # environment startup its own multiplier (default: 3x -> 1800s).
+        env_config.import_path = "sandoq_env:SandoqEnvironment"
+        environment_build_timeout_multiplier = float(
+            os.environ.get("SANDOQ_BUILD_TIMEOUT_MULTIPLIER", "3")
+        )
+    elif env_type:
         env_config.type = EnvironmentType(env_type)
 
     return TrialConfig(
@@ -565,6 +684,7 @@ def build_trial_config(
         trials_dir=trials_dir,
         agent=agent_config,
         environment=env_config,
+        environment_build_timeout_multiplier=environment_build_timeout_multiplier,
     )
 
 
@@ -642,13 +762,22 @@ def _emit_infra_sidecars(trials_dir: Path) -> dict[str, int]:
     return counts
 
 
-def _sanitize_and_upload(trials_dir: Path):
-    """Sanitize traces (strip API keys) and upload to Railway S3."""
+def _sanitize_and_upload(
+    trials_dir: Path,
+    task_names: list[str] | None = None,
+    *,
+    completed_only: bool = False,
+):
+    """Sanitize traces locally, then upload them to Railway S3 if configured.
+
+    Sanitization is unconditional and fail-closed: local-only runs must not
+    retain raw credentials, and an upload must never proceed if the sanitizer
+    is missing, times out, or reports an error.
+    """
     import subprocess as _sp
 
     scripts_dir = REPO_ROOT / "scripts"
     sanitize_script = scripts_dir / "sanitize_traces.py"
-    upload_script = scripts_dir / "upload_traces.py"
     # Resolve a usable python3: prefer the same interpreter we're already running
     # (works whether we were invoked from the main repo or a worktree without its
     # own .venv); fall back to REPO_ROOT/.venv for backward compat with hosts that
@@ -656,20 +785,46 @@ def _sanitize_and_upload(trials_dir: Path):
     venv_python = REPO_ROOT / ".venv" / "bin" / "python3"
     python_bin = sys.executable if Path(sys.executable).exists() else str(venv_python)
 
-    # Check for bucket credentials
-    bucket = os.environ.get("BUCKET_NAME", "")
-    if not bucket:
-        log.info("Skipping trace upload: BUCKET_NAME not set")
-        return
-
     # Sanitize — pass --trials-dir so non-default paths (trials_<model>_v0XX/)
     # are scrubbed. Without this arg, sanitize_traces.py defaults to ./trials
     # and silently skips our actual run output. Was a critical bug pre-v0.4.2:
     # OR API keys + ANTHROPIC_AUTH_TOKEN leaked unredacted into 1755 files.
-    if sanitize_script.exists():
-        log.info("Sanitizing traces in %s ...", trials_dir)
-        _sp.run([python_bin, str(sanitize_script), "--trials-dir", str(trials_dir)],
-                cwd=str(REPO_ROOT), timeout=600, check=False)
+    if not sanitize_script.is_file():
+        raise FileNotFoundError(
+            f"Required trace sanitizer is missing: {sanitize_script}"
+        )
+    if task_names is not None and not task_names:
+        log.info("Skipping scoped trace sanitization: no scheduled tasks")
+        return
+    log.info(
+        "Sanitizing traces in %s (tasks=%s, completed_only=%s) ...",
+        trials_dir,
+        "all" if task_names is None else len(set(task_names)),
+        completed_only,
+    )
+    sanitize_command = [
+        python_bin,
+        str(sanitize_script),
+        "--trials-dir",
+        str(trials_dir),
+    ]
+    if task_names is not None:
+        for task_name in sorted(set(task_names)):
+            sanitize_command.extend(("--task", task_name))
+    if completed_only:
+        sanitize_command.append("--completed-only")
+    _sp.run(
+        sanitize_command,
+        cwd=str(REPO_ROOT),
+        timeout=600,
+        check=True,
+    )
+
+    # Check for bucket credentials only after local sanitization succeeds.
+    bucket = os.environ.get("BUCKET_NAME", "")
+    if not bucket:
+        log.info("Skipping trace upload: BUCKET_NAME not set")
+        return
 
     # Upload — the existing script only checks trials/, so we upload manually
     endpoint = os.environ.get("BUCKET_ENDPOINT", "")
@@ -717,6 +872,10 @@ async def main():
     # pass --user-model openrouter/google/gemini-3.1-pro-preview if needed,
     # but the default OR token has been flaky (401 "User not found").
     parser.add_argument("--user-model", default="gemini/gemini-3.1-pro-preview", help="User sim model")
+    parser.add_argument(
+        "--user-temperature", type=float, default=0.5,
+        help="User-simulator sampling temperature (paper protocol: 0.5).",
+    )
     parser.add_argument("--tag", required=True, help="Short tag for this run")
     parser.add_argument("--workers", type=int, default=20, help="Max concurrent trials (default: 20)")
     parser.add_argument("--env-type", default=None, help="Environment: docker, e2b, etc.")
@@ -736,18 +895,47 @@ async def main():
     parser.add_argument("--tasks", default=None, help="Comma-separated task names or globs")
     parser.add_argument("--skip-existing", action="store_true", help="Skip tasks with existing results")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--replicates", type=int, default=1,
+                        help="Trials per task (k in the paper; Table 2 uses k=2). "
+                             "Each replicate is an independent trial (Harbor assigns "
+                             "a distinct random suffix), so pass@1/SSR/pass2 can be "
+                             "computed across replicates.")
     parser.add_argument("--user-context-chars", type=int, default=3000)
     parser.add_argument("--call-user-on-completion", type=bool, default=True)
     parser.add_argument("--force-build", action="store_true", help="Force E2B template rebuild (recovers from corrupted template aliases)")
     args = parser.parse_args()
+    if not math.isfinite(args.user_temperature) or args.user_temperature < 0:
+        parser.error("--user-temperature must be a finite non-negative number")
+
+    try:
+        validate_qwen_loopback_proxy(args.model)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if args.env_type == "sandoq":
+        # launch.py calls this module directly (it does not pass through
+        # run_sandoq.sh), so fail once before constructing hundreds of trials
+        # instead of recording one credential error per task.
+        from sandoq_env import _read_token
+
+        try:
+            _read_token()
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
 
     # Resolve model + key
     action_model, action_key, _env_var = resolve_model(args.model)
     user_model, user_key, _ = resolve_model(args.user_model or args.model)
 
-    # User sim api_base — force real Anthropic endpoint when proxy is active
+    # User sim api_base. For an Anthropic user-sim, prefer an explicit gateway
+    # (ANTHROPIC_BASE_URL — e.g. the metagen x2p gateway serving Opus) over the
+    # public endpoint; the user-sim runs host-side via litellm, where the gateway
+    # is reachable. Falls back to the real endpoint when no gateway is set.
     user_provider = (args.user_model or args.model).split("/", 1)[0]
-    user_api_base = "https://api.anthropic.com" if user_provider == "anthropic" else None
+    user_api_base = None
+    if user_provider == "anthropic":
+        user_api_base = os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
 
     # Build shared agent env (proxy config — same for all tasks)
     agent_env = build_agent_env(args.model, action_model, action_key)
@@ -800,15 +988,27 @@ async def main():
         task_names = [t.strip() for t in args.tasks.split(",")]
     else:
         task_names = get_all_tasks()
+    requested_task_names = list(task_names)
 
     # Resolve task dirs
     trials_dir = Path(args.trials_dir) if args.trials_dir else REPO_ROOT / "trials"
     trials_dir.mkdir(parents=True, exist_ok=True)
 
-    # Filter completed
+    # Filter completed. In single-directory replicate mode, resume only the
+    # deficit: one surviving result from ``--replicates 2`` must not suppress
+    # the missing second run.
+    completed_counts: dict[str, int] = {}
     if args.skip_existing:
         before = len(task_names)
-        task_names = [t for t in task_names if not is_task_completed(t, trials_dir)]
+        target_replicates = max(1, args.replicates)
+        completed_counts = {
+            task: count_completed_trials(task, trials_dir) for task in task_names
+        }
+        task_names = [
+            task
+            for task in task_names
+            if completed_counts[task] < target_replicates
+        ]
         log.info("Skip existing: %d → %d tasks", before, len(task_names))
 
     # Reproducibility metadata
@@ -820,7 +1020,7 @@ async def main():
     started_at = datetime.now().isoformat()
 
     print(f"\n{'='*70}")
-    print(f"In-Process Eval (Harbor LocalOrchestrator)")
+    print("In-Process Eval (Harbor LocalOrchestrator)")
     print(f"{'='*70}")
     print(f"Git:       {git_sha[:12]} ({git_tag}) tree={git_dirty}")
     print(f"Started:   {started_at}")
@@ -830,30 +1030,71 @@ async def main():
     print(f"Timeout:   {args.agent_timeout or 'default'}s")
     print(f"Tag:       {args.tag}")
     print(f"Workers:   {args.workers}")
+    print(f"Replicates: {args.replicates}")
     print(f"Trials:    {trials_dir}")
     print(f"Tasks:     {len(task_names)}")
     print(f"{'='*70}\n")
 
-    # Save manifest
+    # Save manifest. Resume runs keep the full requested cohort at the top level
+    # and append a run-history entry; otherwise a 27-trial repair pass would
+    # overwrite the original 109-task provenance and look like a partial run.
+    manifest_dir = REPO_ROOT / "pipeline_logs"
+    manifest_dir.mkdir(exist_ok=True)
+    manifest_path = manifest_dir / f"eval-{args.tag}-manifest.json"
+    previous_manifest: dict = {}
+    if manifest_path.exists():
+        try:
+            previous_manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            previous_manifest = {}
+    run_history = list(previous_manifest.get("run_history") or [])
+    if previous_manifest and not run_history:
+        run_history.append(
+            {
+                "started_at": previous_manifest.get("started_at"),
+                "git_sha": previous_manifest.get("git_sha"),
+                "git_dirty": previous_manifest.get("git_dirty"),
+                "scheduled_task_count": previous_manifest.get("task_count"),
+                "scheduled_trial_count": previous_manifest.get(
+                    "scheduled_trial_count"
+                ),
+            }
+        )
+    run_history.append(
+        {
+            "started_at": started_at,
+            "git_sha": git_sha,
+            "git_dirty": git_dirty,
+            "scheduled_task_count": len(task_names),
+            "scheduled_trial_count": sum(
+                max(1, args.replicates) - completed_counts.get(task, 0)
+                for task in task_names
+            ),
+            "skip_existing": args.skip_existing,
+        }
+    )
     manifest = {
         "git_sha": git_sha,
         "git_tag": git_tag,
         "git_dirty": git_dirty,
-        "started_at": started_at,
+        "started_at": previous_manifest.get("started_at") or started_at,
+        "last_started_at": started_at,
         "model": args.model,
         "user_model": args.user_model,
+        "user_temperature": args.user_temperature,
         "agent_type": args.agent_type,
         "env_type": args.env_type,
         "agent_timeout": args.agent_timeout,
         "tag": args.tag,
         "workers": args.workers,
+        "replicates": args.replicates,
         "trials_dir": str(trials_dir),
-        "task_count": len(task_names),
-        "tasks": task_names,
+        "task_count": len(requested_task_names),
+        "tasks": requested_task_names,
+        "scheduled_task_count": len(task_names),
+        "scheduled_tasks": task_names,
+        "run_history": run_history,
     }
-    manifest_dir = REPO_ROOT / "pipeline_logs"
-    manifest_dir.mkdir(exist_ok=True)
-    manifest_path = manifest_dir / f"eval-{args.tag}-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
     log.info("Manifest: %s", manifest_path)
 
@@ -869,23 +1110,28 @@ async def main():
         if task_dir is None:
             log.warning("Task dir not found: %s — skipping", task_name)
             continue
-        tc = build_trial_config(
-            task_dir=task_dir,
-            action_model=action_model,
-            user_model=user_model,
-            user_key=user_key,
-            user_api_base=user_api_base,
-            agent_env=agent_env,
-            trials_dir=trials_dir,
-            env_type=args.env_type,
-            agent_timeout=args.agent_timeout,
-            user_context_chars=args.user_context_chars,
-            call_user_on_completion=args.call_user_on_completion,
-            force_build=args.force_build,
-            agent_type=args.agent_type,
-            reasoning_effort=args.reasoning_effort,
-        )
-        trial_configs.append(tc)
+        needed_replicates = max(1, args.replicates)
+        if args.skip_existing:
+            needed_replicates -= completed_counts.get(task_name, 0)
+        for _rep in range(needed_replicates):
+            tc = build_trial_config(
+                task_dir=task_dir,
+                action_model=action_model,
+                user_model=user_model,
+                user_key=user_key,
+                user_api_base=user_api_base,
+                agent_env=agent_env,
+                trials_dir=trials_dir,
+                env_type=args.env_type,
+                agent_timeout=args.agent_timeout,
+                user_context_chars=args.user_context_chars,
+                call_user_on_completion=args.call_user_on_completion,
+                force_build=args.force_build,
+                agent_type=args.agent_type,
+                reasoning_effort=args.reasoning_effort,
+                user_temperature=args.user_temperature,
+            )
+            trial_configs.append(tc)
 
     log.info("Built %d trial configs", len(trial_configs))
 
@@ -994,6 +1240,7 @@ async def main():
         "tag": args.tag,
         "model": args.model,
         "user_model": args.user_model,
+        "user_temperature": args.user_temperature,
         "env_type": args.env_type,
         "wall_time_sec": elapsed,
         "total": len(results),
@@ -1014,8 +1261,24 @@ async def main():
         print(f"\nInfra audit: {infra_counts.get('ok', 0)} ok, "
               f"{infra_counts.get('infra_failed', 0)} infra_failed "
               f"({', '.join(f'{k}={v}' for k, v in infra_counts.items() if k not in ('ok', 'infra_failed'))})")
-    _sanitize_and_upload(trials_dir)
+    _sanitize_and_upload(trials_dir, task_names, completed_only=True)
+
+
+async def _main_with_client_cleanup() -> int | None:
+    """Close LiteLLM's cached aiohttp clients on their owning event loop."""
+    try:
+        return await main()
+    finally:
+        try:
+            from litellm import close_litellm_async_clients
+
+            await close_litellm_async_clients()
+        except Exception as exc:
+            # Results and trace sanitization have already completed.  Cleanup
+            # is hygiene, so an upstream LiteLLM version mismatch must not
+            # replace the benchmark's real exit status.
+            log.warning("LiteLLM async client cleanup failed: %s", exc)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(_main_with_client_cleanup()))

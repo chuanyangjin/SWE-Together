@@ -45,9 +45,14 @@ from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.llms.lite_llm import LiteLLM
+from harbor.utils.redaction import redact_artifact_text
 
 from ..exec_helpers import TRIAL_BUDGET_SEC, exec_with_budget
-from proxies.litellm_proxy import launch_litellm_proxy, mask_proxied_model_name
+from proxies.litellm_proxy import (
+    allocate_litellm_proxy_port,
+    launch_litellm_proxy,
+    mask_proxied_model_name,
+)
 from ..repo_config import discover_repo_config_files
 from ..repo_diff import capture_git_diff, tag_harbor_base
 from ..user_agent import UserAgent, UserDecision
@@ -114,6 +119,7 @@ class UserEnabledOpenCode(BaseAgent):
         session_analysis: str = "",
         max_messages: int | None = None,
         call_user_on_completion: bool = True,
+        trial_budget_sec: int | None = None,
         # Default to `high` so missed launcher flags don't silently disable
         # thinking on agentic trials. Matches Anthropic adaptive-thinking's
         # recommended default for complex / multi-turn tasks (see
@@ -145,6 +151,7 @@ class UserEnabledOpenCode(BaseAgent):
         # model field to MiniMax-M2.7 / glm-5.1 / etc. before forwarding.
         inner_model_name = mask_proxied_model_name(model_name)
         self._using_proxied_provider = inner_model_name != model_name
+        self._litellm_proxy_port = int(os.environ.get("LITELLM_PROXY_PORT", "4210"))
         if self._using_proxied_provider:
             log.info(
                 "opencode: masking model %r → %r for Harbor + opencode CLI (proxy handles real routing)",
@@ -184,6 +191,7 @@ class UserEnabledOpenCode(BaseAgent):
         )
         self._ctx_budget = max(500, user_context_chars)
         self._check_on_completion = call_user_on_completion
+        self._trial_budget_sec = trial_budget_sec or TRIAL_BUDGET_SEC
         self._task_instruction = ""
         self._cumulative_output: list[str] = []
         self._start_time: float = 0.0
@@ -201,6 +209,20 @@ class UserEnabledOpenCode(BaseAgent):
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await self._inner.setup(environment)
+        # Harbor's OpenCode commands tee their JSON stream to
+        # /logs/agent/opencode.txt. E2B normally supplies that directory, but
+        # non-mounted Podman/Sandoq backends do not; without it, every otherwise
+        # successful command exits 1 because tee cannot open the path. The
+        # wrapper still captures stdout host-side, but creating the directory
+        # preserves truthful command status and the in-sandbox recovery path.
+        log_dir_result = await environment.exec(
+            command="mkdir -p /logs/agent", timeout_sec=30
+        )
+        if log_dir_result.return_code != 0:
+            raise RuntimeError(
+                "failed to create /logs/agent for OpenCode output: "
+                f"{log_dir_result.stderr or log_dir_result.stdout or 'unknown error'}"
+            )
         # Tag every git repo as `harbor-base` so per-turn `git diff` can
         # show only the agent's edits, even when a Dockerfile post-checkout
         # `git commit` lands mid-trial. See repo_diff for rationale.
@@ -212,7 +234,14 @@ class UserEnabledOpenCode(BaseAgent):
         # + ANTHROPIC_BASE_URL=http://localhost:4210 in the agent env; the
         # helper picks those up and starts the proxy. No-op when env vars
         # aren't set (direct Anthropic or codex-oauth runs).
-        await launch_litellm_proxy(environment, self.logs_dir)
+        if self._using_proxied_provider:
+            self._litellm_proxy_port = allocate_litellm_proxy_port(environment)
+            if not await launch_litellm_proxy(
+                environment,
+                self.logs_dir,
+                proxy_port=self._litellm_proxy_port,
+            ):
+                raise RuntimeError("required in-sandbox model proxy failed to start")
         # OAuth proxy path (MSWEA_USE_CODEX_OAUTH reused as the universal
         # "use host ChatGPT subscription" flag): drop oauth_proxy.py +
         # ~/.codex/auth.json into the sandbox, start the proxy on
@@ -285,8 +314,11 @@ class UserEnabledOpenCode(BaseAgent):
             "  cat /tmp/oauth_proxy_import.err >&2 2>/dev/null; "
             "  exit 1; "
             "fi; "
+            # This loopback lives inside the per-trial sandbox namespace. The
+            # host-side/canonical proxy never uses this unauthenticated opt-in.
             "nohup python3 /tmp/oauth_proxy.py "
             "  --port 4220 --auth-json /tmp/codex-auth.json "
+            "  --allow-unauthenticated-loopback "
             "  > /tmp/oauth_proxy.log 2>&1 & "
             "for i in $(seq 1 20); do "
             "  sleep 1; "
@@ -395,12 +427,23 @@ class UserEnabledOpenCode(BaseAgent):
                     "run --format=json", f"run {extra}--format=json", 1,
                 )
                 if patch_cfg:
-                    c.command = f"{patch_cfg} && {c.command}"
+                    # Group the original Harbor command. It commonly begins
+                    # with ``. ~/.nvm/nvm.sh; opencode ...``; without grouping,
+                    # shell ``;`` precedence runs opencode even when the config
+                    # patch failed, silently bypassing the localhost proxy.
+                    c.command = f"{patch_cfg} && ({c.command})"
             if oauth_on:
                 if c.env is None:
                     c.env = {}
                 c.env["OPENAI_BASE_URL"] = "http://127.0.0.1:4220/v1"
                 c.env["OPENAI_API_KEY"] = "placeholder"
+            if self._using_proxied_provider:
+                if c.env is None:
+                    c.env = {}
+                proxy_port = getattr(self, "_litellm_proxy_port", 4210)
+                proxy_base = f"http://localhost:{proxy_port}"
+                c.env["ANTHROPIC_API_BASE"] = proxy_base
+                c.env["ANTHROPIC_BASE_URL"] = proxy_base
         return commands
 
     def _opencode_thinking_patch_command(self) -> str | None:
@@ -442,7 +485,6 @@ class UserEnabledOpenCode(BaseAgent):
         # Provides deep reasoning on complex tasks." Medium "may skip thinking
         # for very simple queries", which on a 13-turn agentic trial means the
         # model skips reasoning on most tool-result observations.
-        effort = self._reasoning_effort or "high"
         # Reasoning engages via per-model variants, not provider-factory options.
         # opencode v1.15.13 resolves the effort by looking up
         # `model.variants[<flag-value>]` (session/llm/request.ts:78-81); the
@@ -472,15 +514,23 @@ class UserEnabledOpenCode(BaseAgent):
         # at a different layer (variants() switch case `@ai-sdk/openai`); we
         # don't touch that path here.
         _OR_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
-        # python3 instead of jq — guaranteed present in the base images.
+        # OpenCode's setup guarantees Node, but several minimal task images
+        # (notably the Hyperswitch images) have neither python3 nor jq.  Patch
+        # the JSON with Node itself so provider routing cannot silently fall
+        # back to api.anthropic.com when Python is absent.
         # Heredoc avoids shell-quoting hell around the embedded JSON literal.
         script = (
-            "import json, pathlib, os\n"
-            "p = pathlib.Path.home()/'.config/opencode/opencode.json'\n"
-            "cfg = json.loads(p.read_text()) if p.exists() else {}\n"
-            "prov = cfg.setdefault('provider', {})\n"
+            "const fs = require('fs');\n"
+            "const os = require('os');\n"
+            "const path = require('path');\n"
+            "const p = path.join(os.homedir(), '.config', 'opencode', 'opencode.json');\n"
+            "let cfg = {};\n"
+            "if (fs.existsSync(p)) cfg = JSON.parse(fs.readFileSync(p, 'utf8'));\n"
+            "if (!cfg.provider || typeof cfg.provider !== 'object' || Array.isArray(cfg.provider)) cfg.provider = {};\n"
+            "const prov = cfg.provider;\n"
         )
         if self._using_proxied_provider:
+            proxy_port = getattr(self, "_litellm_proxy_port", 4210)
             # Route opencode's anthropic provider (@ai-sdk/anthropic) to the
             # in-sandbox proxy on localhost:4210. The masked model name puts
             # us on the 'anthropic' provider, whose default baseURL is
@@ -491,11 +541,12 @@ class UserEnabledOpenCode(BaseAgent):
             # "/messages" to baseURL, so "/v1" stays in the value. Config
             # persists in the sandbox, so --session resume turns inherit it.
             script += (
-                "prov.setdefault('anthropic', {}).setdefault('options', {})"
-                "['baseURL'] = 'http://localhost:4210/v1'\n"
+                "if (!prov.anthropic || typeof prov.anthropic !== 'object' || Array.isArray(prov.anthropic)) prov.anthropic = {};\n"
+                "if (!prov.anthropic.options || typeof prov.anthropic.options !== 'object' || Array.isArray(prov.anthropic.options)) prov.anthropic.options = {};\n"
+                f"prov.anthropic.options.baseURL = 'http://localhost:{proxy_port}/v1';\n"
             )
         script += (
-            "or_efforts = " + json.dumps(list(_OR_EFFORTS)) + "\n"
+            "const orEfforts = " + json.dumps(list(_OR_EFFORTS)) + ";\n"
             # Only the `openrouter` provider entry needs the explicit variants
             # write; for other providers (openai/deepseek/anthropic) opencode's
             # auto-generator emits the right per-provider shape from the
@@ -505,56 +556,66 @@ class UserEnabledOpenCode(BaseAgent):
             # ds, and the proxied anthropic path. The reasoning=true flag on
             # the model entry is safe across providers — it only ever upgrades
             # capability detection.
-            "for name in list(prov):\n"
-            "    models = prov[name].setdefault('models', {})\n"
-            "    for mid in list(models):\n"
-            "        entry = models[mid] if isinstance(models[mid], dict) else {}\n"
-            "        entry['reasoning'] = True\n"
-            "        if name == 'openrouter':\n"
-            "            variants = entry.setdefault('variants', {})\n"
-            "            for eff in or_efforts:\n"
-            "                variants.setdefault(eff, {'reasoning': {'effort': eff}})\n"
-            "        models[mid] = entry\n"
-            "perm = cfg.get('permission')\n"
-            "if perm != 'allow':\n"
-            "    if not isinstance(perm, dict):\n"
-            "        perm = {'*': perm} if isinstance(perm, str) else {}\n"
-            "    ext = perm.get('external_directory')\n"
-            "    if ext != 'allow':\n"
-            "        if not isinstance(ext, dict):\n"
-            "            ext = {'*': ext} if isinstance(ext, str) else {}\n"
-            "        for pattern in [\n"
-            "            '/workspace/**', '/tmp/**', '/var/tmp/**',\n"
-            "            '/opt/**', '/root/**', '/home/**',\n"
-            "            '/proc/**', '/usr/**', '/logs/**',\n"
-            "        ]:\n"
-            "            ext.setdefault(pattern, 'allow')\n"
-            "        perm['external_directory'] = ext\n"
-            "    cfg['permission'] = perm\n"
+            "Object.keys(prov).forEach(function(name) {\n"
+            "  let provider = prov[name];\n"
+            "  if (!provider || typeof provider !== 'object' || Array.isArray(provider)) provider = prov[name] = {};\n"
+            "  let models = provider.models;\n"
+            "  if (!models || typeof models !== 'object' || Array.isArray(models)) models = provider.models = {};\n"
+            "  Object.keys(models).forEach(function(mid) {\n"
+            "    let entry = models[mid];\n"
+            "    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) entry = {};\n"
+            "    entry.reasoning = true;\n"
+            "    if (name === 'openrouter') {\n"
+            "      let variants = entry.variants;\n"
+            "      if (!variants || typeof variants !== 'object' || Array.isArray(variants)) variants = entry.variants = {};\n"
+            "      orEfforts.forEach(function(eff) {\n"
+            "        if (!Object.prototype.hasOwnProperty.call(variants, eff)) variants[eff] = {reasoning: {effort: eff}};\n"
+            "      });\n"
+            "    }\n"
+            "    models[mid] = entry;\n"
+            "  });\n"
+            "});\n"
+            "let perm = cfg.permission;\n"
+            "if (perm !== 'allow') {\n"
+            "  if (!perm || typeof perm !== 'object' || Array.isArray(perm)) perm = typeof perm === 'string' ? {'*': perm} : {};\n"
+            "  let ext = perm.external_directory;\n"
+            "  if (ext !== 'allow') {\n"
+            "    if (!ext || typeof ext !== 'object' || Array.isArray(ext)) ext = typeof ext === 'string' ? {'*': ext} : {};\n"
+            "    ['/workspace/**', '/tmp/**', '/var/tmp/**', '/opt/**', '/root/**', '/home/**', '/proc/**', '/usr/**', '/logs/**'].forEach(function(pattern) {\n"
+            "      if (!Object.prototype.hasOwnProperty.call(ext, pattern)) ext[pattern] = 'allow';\n"
+            "    });\n"
+            "    perm.external_directory = ext;\n"
+            "  }\n"
+            "  cfg.permission = perm;\n"
+            "}\n"
             # PR #221: per-task disallowed_tools — disable webfetch/websearch
             # at the opencode.json `permission.tools` registry. opencode's
             # core picks this up at session start (run.ts → permission resolver)
             # and refuses the tool with "tool unavailable" without ever calling
             # the model with it. Confirmed-working with v1.15.13.
-            f"_disallow = {json.dumps([t.strip().lower() for t in (self._disallowed_tools or '').split(',') if t.strip()])}\n"
-            "if _disallow:\n"
-            "    _perm = cfg.setdefault('permission', {})\n"
-            "    if not isinstance(_perm, dict): _perm = {}\n"
-            "    _tools = _perm.setdefault('tools', {})\n"
-            "    if not isinstance(_tools, dict): _tools = {}\n"
-            "    for _t in _disallow:\n"
-            "        _tools[_t] = 'deny'\n"
-            "    _perm['tools'] = _tools\n"
-            "    cfg['permission'] = _perm\n"
-            "p.parent.mkdir(parents=True, exist_ok=True)\n"
-            "p.write_text(json.dumps(cfg, indent=2))\n"
+            f"const disallow = {json.dumps([t.strip().lower() for t in (self._disallowed_tools or '').split(',') if t.strip()])};\n"
+            "if (disallow.length) {\n"
+            "  let pperm = cfg.permission;\n"
+            "  if (!pperm || typeof pperm !== 'object' || Array.isArray(pperm)) pperm = {};\n"
+            "  let tools = pperm.tools;\n"
+            "  if (!tools || typeof tools !== 'object' || Array.isArray(tools)) tools = {};\n"
+            "  disallow.forEach(function(tool) { tools[tool] = 'deny'; });\n"
+            "  pperm.tools = tools;\n"
+            "  cfg.permission = pperm;\n"
+            "}\n"
+            "fs.mkdirSync(path.dirname(p), {recursive: true});\n"
+            "fs.writeFileSync(p, JSON.stringify(cfg, null, 2));\n"
         )
         # Subshell wrap is load-bearing: the caller chains this with
         # `... && opencode run ...`. A bare heredoc can't be chained — bash
         # requires the closer (PYEOF) alone on its line, but `&&` can't start
         # a line. Wrapping in `(...)` puts `)` on its own line to close the
         # heredoc and lets `) && opencode` sit on one valid line.
-        return f"(python3 - <<'PYEOF'\n{script}PYEOF\n)"
+        return (
+            '(if [ -f "$HOME/.nvm/nvm.sh" ]; then '
+            '. "$HOME/.nvm/nvm.sh"; fi; node - <<\'JSEOF\'\n'
+            f"{script}JSEOF\n)"
+        )
 
     # ── resume command builder ────────────────────────────────────────
 
@@ -581,7 +642,7 @@ class UserEnabledOpenCode(BaseAgent):
         return ExecInput(
             command=(
                 ". ~/.nvm/nvm.sh; "
-                f"opencode --model={self._inner.model_name} run "
+                f"opencode --model={shlex.quote(self._inner._run_model_ref())} run "
                 f"--session={shlex.quote(session_id)} {flags}"
                 f"--format=json -- {escaped_message} "
                 f"2>&1 </dev/null | stdbuf -oL tee -a {_OPENCODE_LOG}"
@@ -737,6 +798,23 @@ class UserEnabledOpenCode(BaseAgent):
         except Exception as e:
             log.debug("opencode turn-%d archive failed: %s", turn, e)
 
+    def _sync_combined_opencode_log(self) -> None:
+        """Materialize the host log consumed by Harbor's ATIF/token parser.
+
+        Podman keeps ``/logs/agent/opencode.txt`` inside the task container, so
+        the wrapper's per-turn stdout captures are the authoritative host-side
+        stream.  Write their combined form before asking the inner OpenCode
+        adapter to populate ``AgentContext``.
+        """
+        streams = [stream for stream in self._cumulative_output if stream]
+        if not streams:
+            return
+        try:
+            self.logs_dir.mkdir(parents=True, exist_ok=True)
+            (self.logs_dir / "opencode.txt").write_text("\n".join(streams))
+        except OSError as exc:
+            log.warning("Failed to materialize combined OpenCode log: %s", exc)
+
     async def _recover_opencode_log_after_cap(self, environment, turn: int) -> bool:
         """Recover OpenCode's live JSON stream after exec_with_budget kills a turn."""
         try:
@@ -746,6 +824,9 @@ class UserEnabledOpenCode(BaseAgent):
             )
             stdout = getattr(oc_read, "stdout", "")
             if stdout:
+                stdout = redact_artifact_text(
+                    stdout, getattr(self, "_inner_run_env", None)
+                )
                 self._cumulative_output.append(stdout)
                 self._archive_turn_stdout(turn, stdout)
                 log.info(
@@ -891,18 +972,23 @@ class UserEnabledOpenCode(BaseAgent):
             for i, exec_input in enumerate(commands):
                 result, timed_out = await exec_with_budget(
                     environment, exec_input, start_time=self._start_time,
+                    trial_budget_sec=self._trial_budget_sec,
                 )
+                safe_stdout = redact_artifact_text(result.stdout, exec_input.env)
+                safe_stderr = redact_artifact_text(result.stderr, exec_input.env)
                 if result.stdout:
-                    self._cumulative_output.append(result.stdout)
+                    self._cumulative_output.append(safe_stdout)
 
                 command_dir = self.logs_dir / f"command-0-{i}"
                 command_dir.mkdir(parents=True, exist_ok=True)
-                (command_dir / "command.txt").write_text(exec_input.command)
+                (command_dir / "command.txt").write_text(
+                    redact_artifact_text(exec_input.command, exec_input.env)
+                )
                 (command_dir / "return-code.txt").write_text(str(result.return_code))
                 if result.stdout:
-                    (command_dir / "stdout.txt").write_text(result.stdout)
+                    (command_dir / "stdout.txt").write_text(safe_stdout)
                 if result.stderr:
-                    (command_dir / "stderr.txt").write_text(result.stderr)
+                    (command_dir / "stderr.txt").write_text(safe_stderr)
                 if timed_out:
                     turn0_timed_out = True
                     break
@@ -931,6 +1017,7 @@ class UserEnabledOpenCode(BaseAgent):
         session_id = self._find_session_id()
         if not session_id:
             log.warning("Could not find OpenCode sessionID — skipping user sim turns")
+            self._sync_combined_opencode_log()
             try:
                 self._inner.populate_context_post_run(context)
             except Exception as e:
@@ -951,10 +1038,10 @@ class UserEnabledOpenCode(BaseAgent):
         cap_rescue_pending = turn0_timed_out
         for turn in range(1, _MAX_RESUME_TURNS + 1):
             elapsed = time.monotonic() - self._start_time
-            if elapsed > TRIAL_BUDGET_SEC:
+            if elapsed > self._trial_budget_sec:
                 log.warning(
                     "Trial budget exceeded (%.0fs > %ds) — stopping at turn %d",
-                    elapsed, TRIAL_BUDGET_SEC, turn,
+                    elapsed, self._trial_budget_sec, turn,
                 )
                 break
             if cap_rescue_pending:
@@ -995,18 +1082,23 @@ class UserEnabledOpenCode(BaseAgent):
             try:
                 result, timed_out = await exec_with_budget(
                     environment, resume_cmd, start_time=self._start_time,
+                    trial_budget_sec=self._trial_budget_sec,
                 )
+                safe_stdout = redact_artifact_text(result.stdout, resume_cmd.env)
+                safe_stderr = redact_artifact_text(result.stderr, resume_cmd.env)
                 if result.stdout:
-                    self._cumulative_output.append(result.stdout)
+                    self._cumulative_output.append(safe_stdout)
 
                 command_dir = self.logs_dir / f"command-{turn}-0"
                 command_dir.mkdir(parents=True, exist_ok=True)
-                (command_dir / "command.txt").write_text(resume_cmd.command)
+                (command_dir / "command.txt").write_text(
+                    redact_artifact_text(resume_cmd.command, resume_cmd.env)
+                )
                 (command_dir / "return-code.txt").write_text(str(result.return_code))
                 if result.stdout:
-                    (command_dir / "stdout.txt").write_text(result.stdout)
+                    (command_dir / "stdout.txt").write_text(safe_stdout)
                 if result.stderr:
-                    (command_dir / "stderr.txt").write_text(result.stderr)
+                    (command_dir / "stderr.txt").write_text(safe_stderr)
                 if timed_out:
                     turn_timed_out = True
             finally:
@@ -1036,6 +1128,7 @@ class UserEnabledOpenCode(BaseAgent):
         # Post-run: populate trajectory via inner agent (parses opencode.txt
         # into ATIF; this is why we used `tee -a` rather than per-turn-only
         # files — Harbor's parser walks the full event stream in one pass).
+        self._sync_combined_opencode_log()
         try:
             self._inner.populate_context_post_run(context)
         except Exception as e:

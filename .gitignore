@@ -13,5 +13,11 @@ trials-*/
 trials_*/
 hf_dataset/
 
+# Local orchestration output
+pipeline_logs/
+probe_*.log
+uv_sync.log
+relay_tmp.py
+
 # OS
 .DS_Store

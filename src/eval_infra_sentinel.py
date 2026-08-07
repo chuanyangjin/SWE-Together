@@ -21,14 +21,17 @@ point.
 """
 from __future__ import annotations
 
+import glob as _glob
 import json
 import re
+import subprocess as _subprocess
+from collections import defaultdict as _defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 SIDECAR_NAME = "trial_infra.json"
-SIDECAR_VERSION = 1
+SIDECAR_VERSION = 2
 
 # Patch sizes <= this are treated as "empty" (header-only stubs of the form
 # `=== /workspace/repo (cumulative vs harbor-base) ===`). The longest such
@@ -80,6 +83,7 @@ class TrialSignals:
 
     patch_bytes: int = 0
     patch_missing: bool = True
+    patch_has_changes: bool = False
     assistant_turn_count: int = 0
     assistant_texts: list[str] = field(default_factory=list)
     edit_tool_calls: int = 0
@@ -95,6 +99,9 @@ class TrialSignals:
     result_subtypes: list[str] = field(default_factory=list)
     transcript_present_but_empty: bool = False
     empty_transcript_names: list[str] = field(default_factory=list)
+    result_exception_type: str = ""
+    result_exception_message: str = ""
+    user_sim_error_count: int = 0
 
 
 @dataclass
@@ -233,18 +240,32 @@ def collect_signals(trial_dir: Path) -> TrialSignals:
     # above sees zero turns. Fall back to the opencode transcript so the
     # progress/backend-error detectors have real signals to work with.
     if sig.assistant_turn_count == 0 and sig.all_tool_calls == 0:
-        oc = _stream_signals_opencode(trial_dir / "agent" / "opencode.txt")
-        sig.assistant_turn_count = oc.assistant_turn_count
-        sig.assistant_texts = oc.assistant_texts
-        sig.edit_tool_calls = oc.edit_tool_calls
-        sig.all_tool_calls = oc.all_tool_calls
-        sig.backend_error_turns = oc.backend_error_turns
-        sig.provider_error_texts = oc.provider_error_texts
+        combined = trial_dir / "agent" / "opencode.txt"
+        opencode_paths = [combined] if combined.exists() else sorted(
+            (trial_dir / "agent").glob("opencode.txt.turn-*")
+        )
+        for opencode_path in opencode_paths:
+            oc = _stream_signals_opencode(opencode_path)
+            sig.assistant_turn_count += oc.assistant_turn_count
+            sig.assistant_texts.extend(oc.assistant_texts)
+            sig.edit_tool_calls += oc.edit_tool_calls
+            sig.all_tool_calls += oc.all_tool_calls
+            sig.backend_error_turns += oc.backend_error_turns
+            sig.provider_error_texts.extend(oc.provider_error_texts)
     patch_path = trial_dir / "agent" / "final.patch"
     if patch_path.exists():
         sig.patch_missing = False
         try:
             sig.patch_bytes = patch_path.stat().st_size
+            patch_text = patch_path.read_text(errors="replace")
+            sig.patch_has_changes = bool(
+                re.search(
+                    r"^(?:diff --git |@@ |GIT binary patch\s*$|"
+                    r"Binary files .+ differ\s*$)",
+                    patch_text,
+                    re.MULTILINE,
+                )
+            )
         except OSError:
             sig.patch_bytes = 0
     # Present-but-empty agent transcript = harness launched, agent produced
@@ -256,6 +277,26 @@ def collect_signals(trial_dir: Path) -> TrialSignals:
     if present and all(_is_empty_transcript(p) for p in present):
         sig.transcript_present_but_empty = True
         sig.empty_transcript_names = [p.name for p in present]
+    try:
+        result = json.loads((trial_dir / "result.json").read_text(errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        result = {}
+    exception = result.get("exception_info") if isinstance(result, dict) else None
+    if isinstance(exception, dict):
+        sig.result_exception_type = str(exception.get("exception_type") or "")
+        sig.result_exception_message = str(exception.get("exception_message") or "")
+    for decision_path in sorted(
+        (trial_dir / "agent").glob("episode-*/user_decision.json")
+    ):
+        try:
+            decision = json.loads(decision_path.read_text(errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        raw_response = (
+            decision.get("raw_response") if isinstance(decision, dict) else None
+        )
+        if isinstance(raw_response, str) and raw_response.startswith("error:"):
+            sig.user_sim_error_count += 1
     return sig
 
 
@@ -368,10 +409,34 @@ def _detect_empty_transcript(sig: TrialSignals) -> tuple[bool, str, dict[str, An
     ), {"empty_transcripts": sig.empty_transcript_names}
 
 
+def _detect_agent_setup_failure(
+    sig: TrialSignals,
+) -> tuple[bool, str, dict[str, Any]]:
+    setup_types = {"AgentSetupTimeoutError", "EnvironmentStartTimeoutError"}
+    message = sig.result_exception_message
+    if sig.result_exception_type not in setup_types and not message.startswith(
+        "Agent setup failed"
+    ):
+        return False, "", {}
+    return True, (
+        f"Agent never started: {sig.result_exception_type or 'setup failure'} "
+        f"({message[:200]})"
+    ), {
+        "exception_type": sig.result_exception_type,
+        "exception_message": message[:300],
+    }
+
+
 def _detect_no_agent_progress(sig: TrialSignals) -> tuple[bool, str, dict[str, Any]]:
-    if sig.patch_bytes > EMPTY_PATCH_BYTES:
+    if sig.patch_has_changes:
         return False, "", {}
     if sig.edit_tool_calls > 0:
+        return False, "", {}
+    # A model that genuinely explores, reasons, or calls read-only tools but
+    # ultimately makes no edit is a scored agent failure, not infrastructure.
+    # Restrict this detector to repeated content-free successful steps; empty
+    # transcripts and explicit backend errors have their own detectors.
+    if sig.all_tool_calls > 0 or sig.assistant_texts:
         return False, "", {}
     if sig.assistant_turn_count < MIN_TURNS_FOR_NO_PROGRESS:
         return False, "", {}
@@ -443,6 +508,7 @@ def _detect_opencode_backend_error(sig: TrialSignals) -> tuple[bool, str, dict[s
 # "no_agent_progress" detector runs last so a real provider error gets the
 # precise reason in its sidecar instead of the generic one.
 DETECTORS: list[tuple[str, Any]] = [
+    ("agent_setup_failure", _detect_agent_setup_failure),
     ("empty_transcript", _detect_empty_transcript),
     ("provider_402_balance", _detect_provider_402_balance),
     ("provider_429_quota", _detect_provider_429_quota),
@@ -467,8 +533,8 @@ def classify_trial(trial_dir: Path, strict: bool = False) -> InfraVerdict:
     final.patch. Safe to call before result.json exists (will return ok
     with zero signals).
 
-    Gating predicate: a trial that produced a real patch (``patch_bytes >
-    EMPTY_PATCH_BYTES``) is considered ``ok`` even if its transcript
+    Gating predicate: a trial that produced a structurally real unified/binary
+    patch is considered ``ok`` even if its transcript
     mentions provider errors. The semantics we want from ``infra_failed``
     is "rerunning this trial would likely produce different output";
     that's only true when the agent's work was actually cut short.
@@ -481,13 +547,28 @@ def classify_trial(trial_dir: Path, strict: bool = False) -> InfraVerdict:
     Useful as a more sensitive audit pass.
     """
     sig = collect_signals(trial_dir)
-    has_real_patch = sig.patch_bytes > EMPTY_PATCH_BYTES and not sig.patch_missing
+    has_real_patch = sig.patch_has_changes and not sig.patch_missing
     base_evidence = {
         "patch_bytes": sig.patch_bytes,
         "assistant_turn_count": sig.assistant_turn_count,
         "edit_tool_calls": sig.edit_tool_calls,
         "api_retry_count": sig.api_retry_count,
+        "user_sim_error_count": sig.user_sim_error_count,
     }
+    # Simulator failures are protocol failures even when the action agent made
+    # a real patch: the online wrapper turns the failed call into a silent
+    # no-op, which changes the interaction being measured.
+    if sig.user_sim_error_count:
+        return InfraVerdict(
+            status="infra_failed",
+            reason="user_sim_error",
+            detail=(
+                f"User simulator failed on {sig.user_sim_error_count} turn(s); "
+                "the resulting no-op trajectory is not protocol-valid"
+            ),
+            signals=["user_sim_error"],
+            evidence=base_evidence,
+        )
     if has_real_patch and not strict:
         return InfraVerdict(
             status="ok", reason="", detail="",
@@ -564,11 +645,6 @@ def classify_or_load(trial_dir: Path) -> InfraVerdict:
 #     (result.json fields, exit_status across turn-N.json files, patch
 #     capture gaps, etc.). Used by the CLI for cohort-level reporting.
 # ──────────────────────────────────────────────────────────────────────────
-
-import glob as _glob
-import subprocess as _subprocess
-from collections import defaultdict as _defaultdict
-
 
 def _expand_roots(args: list[str]) -> list[Path]:
     """Accept glob patterns or explicit dir names. Filter to existing dirs."""

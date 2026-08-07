@@ -29,6 +29,7 @@ from harbor.models.trial.result import (
 from harbor.tasks.client import TaskClient
 from harbor.trial.hooks import TrialEvent, TrialHookEvent
 from harbor.utils.logger import logger
+from harbor.utils.redaction import redact_artifact_text, redacted_model_dump_json
 from harbor.verifier.verifier import Verifier
 
 
@@ -320,7 +321,9 @@ class Trial:
 
         self.result.finished_at = datetime.now(timezone.utc)
 
-        self._trial_paths.result_path.write_text(self.result.model_dump_json(indent=4))
+        self._trial_paths.result_path.write_text(
+            redacted_model_dump_json(self.result, indent=4)
+        )
 
         await self._invoke_hooks(TrialEvent.END)
 
@@ -461,7 +464,9 @@ class Trial:
 
     async def run(self) -> TrialResult:
         self._trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
-        self._trial_paths.config_path.write_text(self.config.model_dump_json(indent=4))
+        self._trial_paths.config_path.write_text(
+            redacted_model_dump_json(self.config, indent=4)
+        )
 
         self._result = TrialResult(
             trial_name=self.config.trial_name,
@@ -494,7 +499,7 @@ class Trial:
             except (AgentTimeoutError, NonZeroAgentExitCodeError) as e:
                 self.result.exception_info = ExceptionInfo.from_exception(e)
                 self._trial_paths.exception_message_path.write_text(
-                    traceback.format_exc()
+                    redact_artifact_text(traceback.format_exc())
                 )
                 await self._maybe_download_logs(
                     source_dir=EnvironmentPaths.agent_dir.as_posix(),
@@ -512,7 +517,7 @@ class Trial:
             if self.result.exception_info is None:
                 self.result.exception_info = ExceptionInfo.from_exception(e)
                 self._trial_paths.exception_message_path.write_text(
-                    traceback.format_exc()
+                    redact_artifact_text(traceback.format_exc())
                 )
 
             await self._maybe_download_logs(
@@ -537,7 +542,7 @@ class Trial:
             if self.result.exception_info is None:
                 self.result.exception_info = ExceptionInfo.from_exception(e)
                 self._trial_paths.exception_message_path.write_text(
-                    traceback.format_exc()
+                    redact_artifact_text(traceback.format_exc())
                 )
 
             await self._download_artifacts()

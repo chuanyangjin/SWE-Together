@@ -1,0 +1,4 @@
+runs/
+failed_launches/
+__pycache__/
+*.pyc

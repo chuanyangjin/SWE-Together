@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shlex
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +37,11 @@ from harbor.models.agent.context import AgentContext
 from harbor.llms.lite_llm import LiteLLM
 
 from ..exec_helpers import TRIAL_BUDGET_SEC, exec_with_budget
-from proxies.litellm_proxy import launch_litellm_proxy, mask_proxied_model_name
+from proxies.litellm_proxy import (
+    allocate_litellm_proxy_port,
+    launch_litellm_proxy,
+    mask_proxied_model_name,
+)
 from ..repo_config import discover_repo_config_files
 from ..repo_diff import capture_git_diff, tag_harbor_base
 from ..user_agent import UserAgent, UserDecision
@@ -117,6 +120,7 @@ class UserEnabledMiniSweAgent(BaseAgent):
         session_analysis: str = "",
         max_messages: int | None = None,
         call_user_on_completion: bool = True,
+        trial_budget_sec: int | None = None,
         # `high` is the Anthropic adaptive-thinking documented default and the
         # recommended setting for agentic coding (see
         # https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking).
@@ -140,6 +144,7 @@ class UserEnabledMiniSweAgent(BaseAgent):
         # target before forwarding to api.minimax.io / api.z.ai / etc.
         inner_model_name = mask_proxied_model_name(model_name)
         self._using_proxied_provider = inner_model_name != model_name
+        self._litellm_proxy_port = int(os.environ.get("LITELLM_PROXY_PORT", "4210"))
         if self._using_proxied_provider:
             log.info(
                 "mini-swe-agent: masking model %r → %r for Harbor validator (proxy handles real routing)",
@@ -179,6 +184,7 @@ class UserEnabledMiniSweAgent(BaseAgent):
         )
         self._ctx_budget = max(500, user_context_chars)
         self._check_on_completion = call_user_on_completion
+        self._trial_budget_sec = trial_budget_sec or TRIAL_BUDGET_SEC
         self._task_instruction = ""
         self._cumulative_output: list[str] = []
         self._conversation_history: list[dict[str, str]] = []
@@ -218,7 +224,14 @@ class UserEnabledMiniSweAgent(BaseAgent):
         # + ANTHROPIC_BASE_URL=http://localhost:4210 in the agent env; the
         # helper picks those up and starts the proxy. No-op when the env vars
         # aren't set (direct Anthropic or codex-oauth runs).
-        await launch_litellm_proxy(environment, self.logs_dir)
+        if self._using_proxied_provider:
+            self._litellm_proxy_port = allocate_litellm_proxy_port(environment)
+            if not await launch_litellm_proxy(
+                environment,
+                self.logs_dir,
+                proxy_port=self._litellm_proxy_port,
+            ):
+                raise RuntimeError("required in-sandbox model proxy failed to start")
         # If MSWEA_USE_CODEX_OAUTH=1, drop our oauth_proxy.py + host's
         # ~/.codex/auth.json into the sandbox and start the proxy on
         # 127.0.0.1:4220. LiteLLM clients in the sandbox then route through
@@ -267,8 +280,11 @@ class UserEnabledMiniSweAgent(BaseAgent):
             'export PATH="$HOME/.local/bin:$PATH"; '
             'PROXY_PY="$HOME/.local/share/uv/tools/mini-swe-agent/bin/python"; '
             '[ -x "$PROXY_PY" ] || PROXY_PY=python3; '
+            # This loopback lives inside the per-trial sandbox namespace. The
+            # host-side/canonical proxy never uses this unauthenticated opt-in.
             'nohup "$PROXY_PY" /tmp/oauth_proxy.py '
             "  --port 4220 --auth-json /tmp/codex-auth.json "
+            "  --allow-unauthenticated-loopback "
             "  > /tmp/oauth_proxy.log 2>&1 & "
             "for i in $(seq 1 20); do "
             "  sleep 1; "
@@ -348,8 +364,9 @@ class UserEnabledMiniSweAgent(BaseAgent):
                 # placeholder key and 401s every call (mm27 smoke,
                 # 2026-06-03; same class as the deepseek 401s of 2026-05-29).
                 # LiteLLM appends "/v1/messages" to the base itself.
-                c.env["ANTHROPIC_API_BASE"] = "http://localhost:4210"
-                c.env["ANTHROPIC_BASE_URL"] = "http://localhost:4210"
+                proxy_base = f"http://localhost:{self._litellm_proxy_port}"
+                c.env["ANTHROPIC_API_BASE"] = proxy_base
+                c.env["ANTHROPIC_BASE_URL"] = proxy_base
         return cmds
 
     @staticmethod
@@ -710,6 +727,7 @@ class UserEnabledMiniSweAgent(BaseAgent):
             for i, exec_input in enumerate(commands):
                 result, timed_out = await exec_with_budget(
                     environment, exec_input, start_time=self._start_time,
+                    trial_budget_sec=self._trial_budget_sec,
                 )
                 if result.stdout:
                     self._cumulative_output.append(result.stdout)
@@ -742,10 +760,10 @@ class UserEnabledMiniSweAgent(BaseAgent):
             if turn0_timed_out:
                 break
             elapsed = time.monotonic() - self._start_time
-            if elapsed > TRIAL_BUDGET_SEC:
+            if elapsed > self._trial_budget_sec:
                 log.warning(
                     "Trial budget exceeded (%.0fs > %ds) — stopping at turn %d",
-                    elapsed, TRIAL_BUDGET_SEC, turn,
+                    elapsed, self._trial_budget_sec, turn,
                 )
                 break
             trajectory, observation = self._snapshot_latest_turn()
@@ -779,6 +797,7 @@ class UserEnabledMiniSweAgent(BaseAgent):
                 for j, exec_input in enumerate(rerun_commands):
                     result, timed_out = await exec_with_budget(
                         environment, exec_input, start_time=self._start_time,
+                        trial_budget_sec=self._trial_budget_sec,
                     )
                     if result.stdout:
                         self._cumulative_output.append(result.stdout)

@@ -362,7 +362,22 @@ class LiteLLM(BaseLLM):
                 # If provider (e.g., OpenAI) rejects extra_body parameters, retry without them
                 # Some providers reject custom parameters like: return_token_ids, session_id, etc.
                 error_msg = str(e)
+                # Some reasoning models (e.g. claude-opus-4-8 via the metagen
+                # x2p gateway) reject the `temperature` param outright
+                # ("temperature is deprecated for this model") even though
+                # litellm's param DB lists it as supported for the provider — so
+                # drop_params never strips it. Retry once without temperature.
                 if (
+                    "temperature" in error_msg.lower()
+                    and "temperature" in completion_kwargs
+                ):
+                    self._logger.warning(
+                        f"Model {self._model_name} rejected `temperature`; "
+                        "retrying without it."
+                    )
+                    completion_kwargs.pop("temperature", None)
+                    response = await litellm.acompletion(**completion_kwargs)
+                elif (
                     "Unrecognized request argument" in error_msg
                     and "extra_body" in completion_kwargs
                 ):

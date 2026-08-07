@@ -295,6 +295,26 @@ class OpenCode(BaseInstalledAgent):
             f"~/.config/opencode/skills/ 2>/dev/null || true"
         )
 
+    # Provider id used when routing an `openai/<model>` model at a custom
+    # OpenAI-compatible endpoint (OPENAI_BASE_URL). Deliberately NOT "openai"
+    # so opencode doesn't force its built-in Responses-API path.
+    _OPENAI_COMPAT_PID = "vllm-openai-compatible"
+    _QWEN_LOOPBACK_PLACEHOLDER = "qwen-loopback-placeholder"
+
+    def _run_model_ref(self) -> str:
+        """The `--model` ref for `opencode run`, matching the registered config.
+
+        For a custom OpenAI-compatible endpoint we register the provider under
+        ``_OPENAI_COMPAT_PID`` (see _build_register_config_command), so the run
+        ref must use that id too — otherwise opencode falls back to its built-in
+        `openai` provider and the Responses-API errors return.
+        """
+        if self.model_name and "/" in self.model_name:
+            provider, model_id = self.model_name.split("/", 1)
+            if provider == "openai" and os.environ.get("OPENAI_BASE_URL"):
+                return f"{self._OPENAI_COMPAT_PID}/{model_id}"
+        return self.model_name
+
     def _build_register_config_command(self) -> str | None:
         """Return a shell command that writes the opencode config to ~/.config/opencode/opencode.json.
 
@@ -315,7 +335,39 @@ class OpenCode(BaseInstalledAgent):
 
         if self.model_name and "/" in self.model_name:
             provider, model_id = self.model_name.split("/", 1)
-            config["provider"] = {provider: {"models": {model_id: {}}}}
+            openai_base = os.environ.get("OPENAI_BASE_URL")
+            if provider == "openai" and openai_base:
+                openai_key = os.environ.get("OPENAI_API_KEY", "sk-local")
+                if os.environ.get("SWE_QWEN_LOOPBACK_PROXY") == "1":
+                    if openai_key != self._QWEN_LOOPBACK_PLACEHOLDER:
+                        raise RuntimeError(
+                            "secure Qwen mode refuses a non-placeholder OpenAI key"
+                        )
+                    openai_key = self._QWEN_LOOPBACK_PLACEHOLDER
+                # Custom OpenAI-compatible endpoint (vLLM/LiteLLM serving e.g.
+                # Qwen). Two problems with opencode's built-in `openai` provider:
+                #   1. it talks the Responses API, which vLLM/LiteLLM reject
+                #      ("Input should be a valid string" on body.input);
+                #   2. even with npm overridden, opencode special-cases the
+                #      provider id "openai" and still calls `.responses()`
+                #      ("Z.responses is not a function").
+                # So register under a NON-"openai" provider id with the
+                # openai-compatible npm (Chat Completions) + explicit
+                # baseURL/apiKey, mirroring serve_api_v2 generate-opencode-config.
+                # create_run_agent_commands passes the matching --model ref.
+                config["provider"] = {
+                    self._OPENAI_COMPAT_PID: {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "options": {
+                            "baseURL": openai_base,
+                            "apiKey": openai_key,
+                            "litellmProxy": True,
+                        },
+                        "models": {model_id: {}},
+                    }
+                }
+            else:
+                config["provider"] = {provider: {"models": {model_id: {}}}}
 
         if not config:
             return None
@@ -399,7 +451,7 @@ class OpenCode(BaseInstalledAgent):
             ExecInput(
                 command=(
                     ". ~/.nvm/nvm.sh; "
-                    f"opencode --model={self.model_name} run --format=json -- {escaped_instruction} "
+                    f"opencode --model={self._run_model_ref()} run --format=json -- {escaped_instruction} "
                     f"2>&1 </dev/null | stdbuf -oL tee /logs/agent/opencode.txt"
                 ),
                 env=env,

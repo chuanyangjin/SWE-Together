@@ -14,7 +14,6 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from harbor.agents.installed.base import ExecInput
 from harbor.agents.installed.claude_code import ClaudeCode
@@ -179,6 +178,7 @@ class UserEnabledClaudeCode(BaseAgent):
         session_analysis: str = "",
         max_messages: int | None = None,
         call_user_on_completion: bool = True,
+        trial_budget_sec: int | None = None,
         **kwargs,
     ):
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
@@ -199,6 +199,7 @@ class UserEnabledClaudeCode(BaseAgent):
         )
         self._ctx_budget = max(500, user_context_chars)
         self._check_on_completion = call_user_on_completion
+        self._trial_budget_sec = trial_budget_sec or TRIAL_BUDGET_SEC
         self._task_instruction = ""
         self._cumulative_output: list[str] = []
         # Timing: wall-clock tracking for turn summaries
@@ -473,7 +474,6 @@ server.daemon_threads = True
 print(f"Proxy listening on port {{PORT}}")
 server.serve_forever()
 '''
-            from pathlib import Path
             proxy_path = self.logs_dir / "model_proxy.py"
             proxy_path.write_text(proxy_script)
 
@@ -922,6 +922,7 @@ server.serve_forever()
             for i, exec_input in enumerate(commands):
                 result, timed_out = await exec_with_budget(
                     environment, exec_input, start_time=self._start_time,
+                    trial_budget_sec=self._trial_budget_sec,
                 )
                 if result.stdout:
                     self._cumulative_output.append(result.stdout)
@@ -955,10 +956,10 @@ server.serve_forever()
         cap_rescue_pending = turn0_timed_out
         for turn in range(1, _MAX_RESUME_TURNS + 1):
             elapsed = time.monotonic() - self._start_time
-            if elapsed > TRIAL_BUDGET_SEC:
+            if elapsed > self._trial_budget_sec:
                 log.warning(
                     "Trial budget exceeded (%.0fs > %ds) — stopping at turn %d",
-                    elapsed, TRIAL_BUDGET_SEC, turn,
+                    elapsed, self._trial_budget_sec, turn,
                 )
                 break
 
@@ -1007,6 +1008,7 @@ server.serve_forever()
                 for j, exec_input in enumerate(resume_commands):
                     result, timed_out = await exec_with_budget(
                         environment, exec_input, start_time=self._start_time,
+                        trial_budget_sec=self._trial_budget_sec,
                     )
                     if result.stdout:
                         self._cumulative_output.append(result.stdout)

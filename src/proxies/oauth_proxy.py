@@ -40,19 +40,30 @@ Usage
 -----
 Run as a subprocess from the trial wrapper, or standalone:
 
-    .venv/bin/python -m proxies.oauth_proxy --port 4220
+    .venv/bin/python -m proxies.oauth_proxy --port 4220 \
+        --allow-unauthenticated-loopback
 
 Then point LiteLLM at it:
 
     OPENAI_BASE_URL=http://localhost:4220/v1
     OPENAI_API_KEY=placeholder           # required by LiteLLM but ignored
+
+Secure orchestration supplies a private token file, and every route then
+requires ``Authorization: Bearer <token>``. Unauthenticated loopback serving is
+available only through the loudly named opt-in shown above; it is intended for
+an isolated per-trial sandbox, not a shared host.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import logging
+import os
+import secrets
+import socket
+import stat
 import uuid
 from pathlib import Path
 from typing import Any
@@ -64,6 +75,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_AUTH_JSON = Path.home() / ".codex" / "auth.json"
 UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
+CLIENT_AUTH_MIN_BYTES = 32
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -93,6 +105,87 @@ class AuthCache:
             raise RuntimeError(
                 f"No access_token in {self.auth_path} — run `codex login` first"
             )
+
+
+AUTH_APP_KEY = web.AppKey("oauth_auth", AuthCache)
+CLIENT_AUTH_APP_KEY = web.AppKey("oauth_client_auth_token", str)
+
+
+def read_client_auth_token(path: Path) -> str:
+    """Read a private bearer token without following links or racing a swap."""
+    path = Path(path)
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise RuntimeError("Client-auth file is unavailable") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise RuntimeError("Client-auth path must be a regular non-symlink file")
+    if before.st_uid != os.getuid():
+        raise RuntimeError("Client-auth file must be owned by the current uid")
+    if stat.S_IMODE(before.st_mode) & 0o077:
+        raise RuntimeError("Client-auth file must not be group/world accessible")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError("Client-auth file could not be opened securely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) & 0o077
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise RuntimeError("Client-auth file changed during validation")
+        raw = os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+
+    if len(raw) > 4096:
+        raise RuntimeError("Client-auth token is too large")
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("Client-auth token is not UTF-8") from exc
+    token = decoded.rstrip("\r\n")
+    if (
+        not token
+        or not token.isascii()
+        or token != decoded.strip()
+        or any(ch.isspace() for ch in token)
+    ):
+        raise RuntimeError("Client-auth file must contain exactly one token")
+    if len(token.encode("utf-8")) < CLIENT_AUTH_MIN_BYTES:
+        raise RuntimeError("Client-auth token is too short")
+    return token
+
+
+@web.middleware
+async def require_client_auth(
+    request: web.Request, handler
+) -> web.StreamResponse:
+    """Require the per-run bearer capability when client auth is configured."""
+    expected = request.app.get(CLIENT_AUTH_APP_KEY)
+    if expected is not None:
+        scheme, separator, candidate = request.headers.get(
+            "Authorization", ""
+        ).partition(" ")
+        authorized = (
+            separator == " "
+            and scheme.lower() == "bearer"
+            and secrets.compare_digest(
+                candidate.encode("utf-8"), expected.encode("utf-8")
+            )
+        )
+        if not authorized:
+            return web.json_response(
+                {"error": "client authentication required"},
+                status=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return await handler(request)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -392,7 +485,7 @@ class StreamTranslator:
 # ──────────────────────────────────────────────────────────────────────
 
 async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
-    auth: AuthCache = request.app["auth"]
+    auth: AuthCache = request.app[AUTH_APP_KEY]
     try:
         chat_body = await request.json()
     except Exception as e:
@@ -620,7 +713,7 @@ async def handle_responses(request: web.Request) -> web.StreamResponse:
       - truncate `input` history if the serialized body exceeds ~800KB
         (codex backend rejects bigger bodies with `Request Entity Too Large`)
     """
-    auth: AuthCache = request.app["auth"]
+    auth: AuthCache = request.app[AUTH_APP_KEY]
     try:
         body = await request.json()
     except Exception as e:
@@ -741,11 +834,14 @@ async def handle_models(request: web.Request) -> web.Response:
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    auth: AuthCache = request.app["auth"]
+    # Deliberately omit account identifiers and token metadata.  The endpoint
+    # is a readiness probe, not an auth-inspection API, and its response may be
+    # captured in benchmark orchestration logs.
+    _auth: AuthCache = request.app[AUTH_APP_KEY]
     return web.json_response({
         "ok": True,
-        "account_id": auth.account_id,
-        "access_token_len": len(auth.access_token),
+        "service": "swe-together-oauth-proxy",
+        "client_auth": request.app.get(CLIENT_AUTH_APP_KEY) is not None,
         "upstream": UPSTREAM_URL,
     })
 
@@ -754,29 +850,94 @@ async def handle_health(request: web.Request) -> web.Response:
 # Entry point
 # ──────────────────────────────────────────────────────────────────────
 
-async def run_proxy(host: str, port: int, auth_path: Path) -> None:
+def build_app(auth: AuthCache, client_auth_token: str | None = None) -> web.Application:
+    """Construct the proxy application; exposed separately for focused tests."""
+    app = web.Application(middlewares=[require_client_auth])
+    app[AUTH_APP_KEY] = auth
+    if client_auth_token is not None:
+        app[CLIENT_AUTH_APP_KEY] = client_auth_token
+    app.router.add_post("/v1/chat/completions", handle_chat_completions)
+    app.router.add_post("/v1/responses", handle_responses)
+    app.router.add_get("/v1/models", handle_models)
+    app.router.add_get("/health", handle_health)
+    return app
+
+
+async def run_proxy(
+    host: str,
+    port: int,
+    auth_path: Path,
+    *,
+    client_auth_path: Path | None = None,
+    listen_fd: int | None = None,
+    allow_unauthenticated_loopback: bool = False,
+) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [oauth_proxy] %(message)s",
     )
     auth = AuthCache(auth_path)
-    app = web.Application()
-    app["auth"] = auth
-    app.router.add_post("/v1/chat/completions", handle_chat_completions)
-    app.router.add_post("/v1/responses", handle_responses)
-    app.router.add_get("/v1/models", handle_models)
-    app.router.add_get("/health", handle_health)
+    client_auth_token = (
+        read_client_auth_token(client_auth_path) if client_auth_path else None
+    )
+    if client_auth_token is None and not allow_unauthenticated_loopback:
+        raise RuntimeError(
+            "Client authentication is required; isolated sandboxes must opt in "
+            "with --allow-unauthenticated-loopback"
+        )
+    if client_auth_token is None and listen_fd is None:
+        try:
+            is_loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            is_loopback = host.lower() == "localhost"
+        if not is_loopback:
+            raise RuntimeError(
+                "Unauthenticated OAuth proxy mode is restricted to loopback"
+            )
+    app = build_app(auth, client_auth_token)
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host, port)
+    inherited_socket: socket.socket | None = None
+    if listen_fd is None:
+        site: web.BaseSite = web.TCPSite(runner, host, port)
+        display_host, display_port = host, port
+    else:
+        inherited_socket = socket.socket(fileno=listen_fd)
+        if client_auth_token is None:
+            try:
+                inherited_loopback = ipaddress.ip_address(
+                    inherited_socket.getsockname()[0]
+                ).is_loopback
+            except (ValueError, OSError):
+                inherited_loopback = False
+            if not inherited_loopback:
+                inherited_socket.close()
+                raise RuntimeError(
+                    "Unauthenticated OAuth proxy socket must be loopback-only"
+                )
+        site = web.SockSite(runner, inherited_socket)
+        address = inherited_socket.getsockname()
+        display_host, display_port = str(address[0]), int(address[1])
     await site.start()
-    log.info("listening on http://%s:%d", host, port)
+    log.info("listening on http://%s:%d", display_host, display_port)
     log.info("upstream: %s", UPSTREAM_URL)
-    log.info("auth: %s (account_id=%s)", auth_path, auth.account_id)
+    log.info("auth loaded (credential path and account id redacted)")
+    log.info(
+        "client bearer authentication %s",
+        "enabled" if client_auth_token is not None else "disabled",
+    )
+    if client_auth_token is None:
+        log.warning(
+            "UNAUTHENTICATED LOOPBACK MODE ENABLED; use only inside an isolated "
+            "per-trial sandbox"
+        )
     log.info("client config:")
-    log.info("  OPENAI_BASE_URL=http://%s:%d/v1", host, port)
-    log.info("  OPENAI_API_KEY=placeholder")
+    log.info("  OPENAI_BASE_URL=http://%s:%d/v1", display_host, display_port)
+    if client_auth_token is None:
+        log.info("  OPENAI_API_KEY=placeholder")
+    else:
+        log.info("  Authorization: Bearer <redacted>")
     await asyncio.Event().wait()
 
 
@@ -785,8 +946,35 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=4220)
     parser.add_argument("--auth-json", default=str(DEFAULT_AUTH_JSON))
+    parser.add_argument(
+        "--client-auth-file",
+        type=Path,
+        default=None,
+        help="Private file containing the bearer token required from clients.",
+    )
+    parser.add_argument(
+        "--listen-fd",
+        type=int,
+        default=None,
+        help="Inherited listening socket descriptor (used by secure auto-start).",
+    )
+    parser.add_argument(
+        "--allow-unauthenticated-loopback",
+        action="store_true",
+        help="DANGEROUS on shared hosts: allow unauthenticated loopback serving. "
+        "Intended only for isolated per-trial sandboxes.",
+    )
     args = parser.parse_args()
-    asyncio.run(run_proxy(args.host, args.port, Path(args.auth_json)))
+    asyncio.run(
+        run_proxy(
+            args.host,
+            args.port,
+            Path(args.auth_json),
+            client_auth_path=args.client_auth_file,
+            listen_fd=args.listen_fd,
+            allow_unauthenticated_loopback=args.allow_unauthenticated_loopback,
+        )
+    )
 
 
 if __name__ == "__main__":

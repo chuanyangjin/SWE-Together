@@ -44,7 +44,10 @@ cp .env.example .env     # then fill in the keys you need (table below)
 
 Run everything below with the project venv (`.venv/bin/python`) so harbor is importable.
 
-You also need either an **E2B** account (cloud sandboxes, scales to 100+ concurrent) or local **Docker** (`--env-type docker`). Task images are pulled from `ghcr.io/togetherbench/*`.
+You also need **E2B**, local **Docker**, or the authenticated **Sandoq
+OCI-runner** backend (`--env-type sandoq`). Task images are pulled from
+`ghcr.io/togetherbench/*`. Sandoq setup, its end-to-end probe, and Slurm notes
+are documented in [RUN_SANDOQ.md](RUN_SANDOQ.md).
 
 ### 2. Launch run
 
@@ -76,8 +79,21 @@ Trials land in `trials/canonical_full109/<tag>_r<k>/`; judge aggregates in `resu
 # Stage 2 — judge & score (repeat --trials-root per replicate)
 .venv/bin/python -m eval.run_eval \
   --trials-root trials/opus48_r1 --trials-root trials/opus48_r2 \
-  --tasks-root tasks --output-dir results/opus48 --model-tag opus48
+  --tasks-root tasks --output-dir results/opus48 --model-tag opus48 \
+  --require-complete --expected-replicates 2 \
+  --expected-judge-model anthropic/claude-opus-4-6 \
+  --user-correction-source single \
+  --tag-model gemini/gemini-3.1-pro-preview
 ```
+
+The completeness gate rejects partial replicate matrices, infrastructure
+failures, missing cost data/tags, and mixed judge models. For a compact Table-2
+row, pass both replicate roots to `eval/table2_metrics.py --strict
+--u-corr-source single --expected-tag-model gemini/gemini-3.1-pro-preview`;
+output without `--strict` is explicitly marked diagnostic/noncanonical.
+`canonical_full109.json` follows the released evaluator's single Gemini 3.1
+Pro message tagger. The bundled three-model adjudicator is an optional local
+ensemble and is not part of the protocol stated in the paper.
 
 ---
 
@@ -93,6 +109,14 @@ Most runs need only a subset; `.env.example` documents them all. Minimum for an 
 | `ANTHROPIC_API_KEY` | the Step-1 agentic judge |
 | `GHCR_USER` / `GHCR_TOKEN` | pull task images from `ghcr.io/togetherbench/*` |
 
+The released U-Corr pipeline uses the Gemini tagger above at temperature 0.
+An optional `--user-correction-source threeway` ensemble can compare Gemini
+and Opus labels and arbitrate disagreements through the bundled Codex-OAuth
+proxy, but its output must be labelled as a separate local methodology.
+
+For Sandoq, also set `OCI_RUNNER_TOKEN_FILE` to a non-symlink mode-`0600`
+bearer-token file and run `.venv/bin/python sandoq_probe.py` before a cohort.
+
 
 ---
 
@@ -103,7 +127,7 @@ Tasks are **progressively revealed**, not one-shot. The agent gets `instruction.
 Scoring centers on two axes:
 
 - **Correctness** — an agentic judge decomposes each task into *weighted completeness goals* (frozen per task, so scores are comparable across cohorts) and marks the agent's patch against them, crediting near-misses fairly. Rolled up as `pass@1`, `stable_pass_rate`, and `pass²` at a `judge_score ≥ 0.85` bar.
-- **User Correction** — `#correction + 0.2·nudge`, from per-message tags: how much the user had to push the agent back on track. 
+- **User Correction** — `#correction + 0.2·nudge`, from per-message tags: how much the user had to push the agent back on track. The released evaluator uses one pinned Gemini 3.1 Pro tagger; strict mode validates its model and prompt provenance.
 
 ---
 

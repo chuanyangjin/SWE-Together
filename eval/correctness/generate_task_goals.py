@@ -37,12 +37,28 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from eval.correctness.sandbox import (  # noqa: E402
-    JUDGE_TIMEOUT_SEC,
     JudgeInputs,
-    JudgeRunResult,
     judge_timeout_for_task,
     run_judge_in_e2b,
 )
+
+
+def _judge_runner():
+    """Select the judge backend per ``JUDGE_ENV`` (podman/sandoq host-side loop or E2B).
+
+    Local copy of run_batch's selector — kept here to avoid a circular import
+    (run_batch imports generate_one from this module).
+    """
+    judge_env = os.environ.get("JUDGE_ENV")
+    if judge_env == "podman":
+        from eval.correctness.podman_judge import run_judge_in_podman
+
+        return run_judge_in_podman
+    if judge_env == "sandoq":
+        from eval.correctness.sandoq_judge import run_judge_in_sandoq
+
+        return run_judge_in_sandoq
+    return run_judge_in_e2b
 
 log = logging.getLogger("generate_task_goals")
 logging.basicConfig(
@@ -246,7 +262,7 @@ async def generate_one(task_dir: Path, oauth_token: str, api_key: str | None,
     t0 = time.time()
     log.info("[%s] starting phase-1 judge in E2B sandbox", task_dir.name)
     try:
-        run = await run_judge_in_e2b(
+        run = await _judge_runner()(
             task_name=task_dir.name,
             trial_id=f"{task_dir.name}__phase1",
             inputs=inputs,

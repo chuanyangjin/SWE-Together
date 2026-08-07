@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -67,11 +68,32 @@ def _print_cmd(cmd: list[str]) -> None:
     print("  $ " + " ".join(parts))
 
 
-def _run(cmd: list[str], execute: bool) -> int:
+def _run(cmd: list[str], execute: bool, extra_env: dict[str, str] | None = None) -> int:
     _print_cmd(cmd)
     if not execute:
         return 0
-    return subprocess.run(cmd, cwd=REPO_ROOT).returncode
+    return subprocess.run(
+        cmd, cwd=REPO_ROOT, env={**os.environ, **(extra_env or {})}
+    ).returncode
+
+
+def _trial_budget_env(agent_timeout: object) -> dict[str, str] | None:
+    """Reserve time for patch capture and verifier teardown.
+
+    The shell launchers apply the same 60-second margin.  ``launch.py`` invokes
+    ``src/run_eval.py`` directly, so it must provide the budget itself rather
+    than falling back to the multi-turn wrapper's 5400-second default.  An
+    explicit operator override remains authoritative.
+    """
+    if "TRIAL_BUDGET_SEC" in os.environ or agent_timeout is None:
+        return None
+    try:
+        timeout = int(agent_timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"agent_timeout must be an integer: {agent_timeout!r}") from exc
+    if timeout <= 0:
+        raise ValueError(f"agent_timeout must be positive: {timeout}")
+    return {"TRIAL_BUDGET_SEC": str(timeout - 60 if timeout > 60 else timeout)}
 
 
 def stage_run(plan: dict, models: dict, env_type: str | None, execute: bool) -> int:
@@ -96,16 +118,36 @@ def stage_run(plan: dict, models: dict, env_type: str | None, execute: bool) -> 
                 cmd += ["--agent-timeout", str(cfg["agent_timeout"])]
             if cfg.get("reasoning_effort"):
                 cmd += ["--reasoning-effort", str(cfg["reasoning_effort"])]
+            user_model = cfg.get("user_model", plan.get("user_model"))
+            if user_model:
+                cmd += ["--user-model", str(user_model)]
+            user_temperature = cfg.get(
+                "user_temperature", plan.get("user_temperature")
+            )
+            if user_temperature is not None:
+                cmd += ["--user-temperature", str(user_temperature)]
             if tasks:
                 cmd += ["--tasks", ",".join(tasks)]
             print(f"\n[run] {tag} replicate {rep} -> {out.relative_to(REPO_ROOT)}")
-            rc = _run(cmd, execute) or rc
+            run_rc = _run(cmd, execute, _trial_budget_env(cfg.get("agent_timeout")))
+            rc = run_rc or rc
+            if execute and run_rc:
+                return rc
     return rc
 
 
-def stage_judge(plan: dict, models: dict, results_dir: str, execute: bool) -> int:
+def stage_judge(
+    plan: dict,
+    models: dict,
+    results_dir: str,
+    env_type: str | None,
+    execute: bool,
+) -> int:
     trials_root = REPO_ROOT / plan["trials_root"]
     tasks_root = REPO_ROOT / plan.get("tasks_root", "tasks")
+    judge_model = plan.get("judge_model", "anthropic/claude-opus-4-6")
+    u_corr = plan.get("user_correction") or {}
+    u_corr_source = u_corr.get("source", "single")
     rc = 0
     for tag in models:
         cmd = [sys.executable, "-m", "eval.run_eval"]
@@ -116,9 +158,44 @@ def stage_judge(plan: dict, models: dict, results_dir: str, execute: bool) -> in
             "--tasks-root", str(tasks_root),
             "--output-dir", str(out),
             "--model-tag", tag,
+            "--require-complete",
+            "--expected-replicates", str(len(plan.get("replicates", [1]))),
+            "--expected-judge-model", judge_model,
+            "--user-correction-source", u_corr_source,
+            "--tag-model",
+            u_corr.get(
+                "tag_model",
+                u_corr.get("judge_a_model", "gemini/gemini-3.1-pro-preview"),
+            ),
         ]
+        if u_corr_source == "threeway":
+            cmd += [
+                "--tag-judge-b-model",
+                u_corr.get("judge_b_model", "anthropic/claude-opus-4-6"),
+                "--tag-arbiter-model",
+                u_corr.get("arbiter_model", "gpt-5.5"),
+                "--tag-arbiter-proxy",
+                u_corr.get("arbiter_proxy", "http://127.0.0.1:4220/v1"),
+            ]
+            if u_corr.get("arbiter_auto_start", False):
+                cmd.append("--tag-arbiter-auto-start")
+            if u_corr.get("arbiter_auth_json"):
+                cmd += ["--tag-arbiter-auth-json", u_corr["arbiter_auth_json"]]
+        if plan.get("tasks"):
+            cmd += ["--denom-tasks", str(len(plan["tasks"]))]
         print(f"\n[judge] {tag} -> {out.relative_to(REPO_ROOT)}")
-        rc = _run(cmd, execute) or rc
+        judge_env = env_type if env_type in ("podman", "sandoq") else None
+        extra_env = {"JUDGE_PODMAN_MODEL": judge_model}
+        if judge_env:
+            extra_env["JUDGE_ENV"] = judge_env
+        judge_rc = _run(
+            cmd,
+            execute,
+            extra_env,
+        )
+        rc = judge_rc or rc
+        if execute and judge_rc:
+            return rc
     return rc
 
 
@@ -130,7 +207,8 @@ def main() -> int:
     ap.add_argument("--models", default=None,
                     help="Comma-separated subset of model tags (default: every model in the plan)")
     ap.add_argument("--env-type", default="e2b",
-                    help="Sandbox for the run stage: e2b or docker (default: e2b)")
+                    help="Sandbox for the run stage: e2b, docker, podman, or sandoq "
+                         "(default: e2b)")
     ap.add_argument("--results-dir", default="results",
                     help="Where judge aggregates go (default: results/)")
     ap.add_argument("--execute", action="store_true",
@@ -155,9 +233,13 @@ def main() -> int:
     if args.stage in ("run", "all"):
         print("== STAGE: run (produce trials) ==")
         rc = stage_run(plan, models, args.env_type, args.execute) or rc
+        if args.execute and rc and args.stage == "all":
+            return rc
     if args.stage in ("judge", "all"):
         print("\n== STAGE: judge (score trials) ==")
-        rc = stage_judge(plan, models, args.results_dir, args.execute) or rc
+        rc = stage_judge(
+            plan, models, args.results_dir, args.env_type, args.execute
+        ) or rc
     return rc
 
 

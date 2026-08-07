@@ -3,6 +3,13 @@
   "name": "full109",
   "trials_root": "trials/canonical_full109",
   "tasks_root": "tasks",
+  "judge_model": "anthropic/claude-opus-4-6",
+  "user_model": "gemini/gemini-3.1-pro-preview",
+  "user_temperature": 0.5,
+  "user_correction": {
+    "source": "single",
+    "tag_model": "gemini/gemini-3.1-pro-preview"
+  },
   "models": {
     "opencode_opus48": {
       "model": "openrouter/anthropic/claude-opus-4-8",

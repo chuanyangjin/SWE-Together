@@ -29,6 +29,12 @@ class EnvironmentFactory:
     _ENVIRONMENT_MAP: dict[EnvironmentType, type[BaseEnvironment]] = {
         environment.type(): environment for environment in _ENVIRONMENTS
     }
+    # Optional repository-local environments cannot be imported eagerly here:
+    # doing so would make Harbor itself fail to import when SWE-Together's src/
+    # is not on PYTHONPATH. Resolve them only when explicitly selected by type.
+    _ENVIRONMENT_IMPORT_PATH_MAP: dict[EnvironmentType, str] = {
+        EnvironmentType.SANDOQ: "sandoq_env:SandoqEnvironment",
+    }
 
     @classmethod
     def create_environment(
@@ -42,6 +48,18 @@ class EnvironmentFactory:
         logger: logging.Logger | None = None,
         **kwargs,
     ) -> BaseEnvironment:
+        import_path = cls._ENVIRONMENT_IMPORT_PATH_MAP.get(type)
+        if import_path is not None:
+            return cls.create_environment_from_import_path(
+                import_path=import_path,
+                environment_dir=environment_dir,
+                environment_name=environment_name,
+                session_id=session_id,
+                trial_paths=trial_paths,
+                task_env_config=task_env_config,
+                logger=logger,
+                **kwargs,
+            )
         if type not in cls._ENVIRONMENT_MAP:
             raise ValueError(
                 f"Unsupported environment type: {type}. This could be because the "
